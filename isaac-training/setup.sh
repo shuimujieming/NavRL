@@ -76,7 +76,9 @@ echo "Installing TorchRL..."
 cd ../rl
 python setup.py develop
 
-
+#修复安装后的torch版本问题，以及libxcb版本问题，确保与OmniIsaac Kit兼容。
+pip install torch==2.0.1
+conda install libxcb==1.15
 
 # Check which torch is being used
 python -c "import torch; print(torch.__path__)"

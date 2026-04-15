@@ -4,11 +4,17 @@
 set -e
 
 # Define environment name
-ENV_NAME="NavRL"
+ENV_NAME="navrl"
 
 # Load Conda environment handling
 eval "$(conda shell.bash hook)"
 conda create -n $ENV_NAME python=3.10
+
+conda activate $ENV_NAME
+
+pip install "setuptools<82"
+
+conda deactivate
 
 # Step 1: Setup Orbit
 echo "Setting up Orbit..."
@@ -27,6 +33,9 @@ ln -s ${ISAACSIM_PATH} _isaac_sim
 echo "Running orbit.sh setup..."
 ./orbit.sh --conda $ENV_NAME
 conda activate $ENV_NAME
+
+pip install "setuptools<82"
+
 pip install numpy==1.26.4
 pip install "pydantic!=1.7,!=1.7.1,!=1.7.2,!=1.7.3,!=1.8,!=1.8.1,<2.0.0,>=1.6.2"
 pip install imageio-ffmpeg==0.4.9

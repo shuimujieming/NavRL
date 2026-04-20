@@ -481,10 +481,13 @@ class NavigationEnv(IsaacEnv):
         current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
         rpos_clipped = rpos / distance.clamp(1e-6) # unit vector: start to goal direction
+        rpos_clipped[...,2] = 0. # only care about the horizontal direction for the input, we will add vertical distance as a separate input
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
-        
+        # print("rpos_clipped_g", rpos_clipped_g)
+
         # c. velocity in the goal frame
         vel_w = self.root_state[..., 7:10] # world vel
+        vel_w[...,2] = 0. # only care about horizontal velocity for the input, we will add vertical velocity as a separate input
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
         # final drone's internal states
@@ -600,7 +603,7 @@ class NavigationEnv(IsaacEnv):
         if (self.cfg.env_dyn.num_obstacles != 0):
             self.reward = reward_vel + 1. + reward_safety_static*2.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
         else:
-            self.reward = reward_vel + 1. + reward_safety_static*2.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
+            self.reward = reward_vel*2.0 + reward_safety_static*2.0 - penalty_smooth * 2.0 - penalty_height * 4.0 + reward_yaw*8.0 + reward_goal* 8.0
 
         self.last_distance = distance
 

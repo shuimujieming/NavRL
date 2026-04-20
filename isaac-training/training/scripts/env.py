@@ -466,6 +466,11 @@ class NavigationEnv(IsaacEnv):
         target_dir_2d = self.target_dir.clone()
         target_dir_2d[..., 2] = 0
 
+        # current robot heading direction in the horizontal plane
+        current_head_dir_2d = quat_axis(self.root_state[..., 3:7], axis=0)
+        current_head_dir_2d[..., 2] = 0
+        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
         rpos_clipped = rpos / distance.clamp(1e-6) # unit vector: start to goal direction
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
         
@@ -539,7 +544,7 @@ class NavigationEnv(IsaacEnv):
         obs = {
             "state": drone_state,
             "lidar": self.lidar_scan,
-            "direction": target_dir_2d,
+            "direction": current_head_dir_2d,
             "dynamic_obstacle": dyn_obs_states
         }
 

@@ -7,6 +7,7 @@ from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
+from omni_drones.utils.torch import quaternion_to_euler
 
 
 
@@ -42,6 +43,8 @@ class PPO(TensorDictModuleBase):
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
+        print("action dim: ", self.action_dim)
+        self.action_dim = 3 # only control x, z velocity and yaw rate
         self.actor = ProbabilisticActor(
             TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
             in_keys=["alpha", "beta"],
@@ -87,8 +90,26 @@ class PPO(TensorDictModuleBase):
 
         # Cooridnate change: transform local to world
         actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
-        actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
-        tensordict["agents", "action"] = actions_world
+        # print("actions: ", actions)
+        # print("actions shape: ", actions.shape)
+
+        actions_xyz = torch.zeros((*actions.shape[:-1], 3), device=actions.device)
+        actions_xyz[..., [0, 2]] = actions[..., [0, 1]] # map the first two dimension of action to x and z velocity
+        # print("actions xyz: ", actions_xyz)
+
+        # quat = tensordict[("info", "drone_state")][..., 3:7]
+        # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
+
+
+        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "direction"])
+        # print("actions world: ", actions_world)
+
+        actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)
+        actions_target[..., :3] = actions_world
+        actions_target[..., 3] = actions[..., 2].unsqueeze(1) # yaw rate
+        # print("actions target: ", actions_target)
+
+        tensordict["agents", "action"] = actions_target
         return tensordict
 
     def train(self, tensordict):

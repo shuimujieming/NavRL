@@ -50,14 +50,14 @@ def main(cfg):
     transforms = []
     # transforms.append(ravel_composite(env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
     controller = LeePositionController(9.81, env.drone.params).to(cfg.device)
-    vel_transform = VelController(controller, yaw_control=False)
+    vel_transform = VelController(controller, yaw_control=True)
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
     transformed_env.set_seed(cfg.seed)    
     # PPO Policy
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
 
-    checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_final.pt"
+    checkpoint = "/home/shuimujieming/NavRL/isaac-training/wandb/run-20260420_031033-tqw0kzwg/files/checkpoint_final.pt"
     policy.load_state_dict(torch.load(checkpoint))
     
     # Episode Stats Collector

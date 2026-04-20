@@ -35,7 +35,8 @@ class NavigationEnv(IsaacEnv):
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
-
+        self.first_distance_flag = False
+        self.last_distance = 0.0
         super().__init__(cfg, cfg.headless)
         
         # Drone Initialization
@@ -444,15 +445,20 @@ class NavigationEnv(IsaacEnv):
         # Optional render for LiDAR
         if self._should_render(0):
             self.debug_draw.clear()
-            x = self.lidar.data.pos_w[0]
-            # set_camera_view(
-            #     eye=x.cpu() + torch.as_tensor(self.cfg.viewer.eye),
-            #     target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)                        
-            # )
-            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
-            # self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
-            # self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
-            self.debug_draw.vector(x.expand_as(v[:, 0])[0], v[0, 0])
+
+            heading_dir = quat_axis(self.root_state[..., 3:7], axis=0)
+            # print("heading_dir", heading_dir.squeeze(1).shape)
+            # Scale the arrow length for better visibility
+            arrow_length = 2.0
+            self.debug_draw.vector(self.root_state[..., :3], heading_dir.squeeze(1) * arrow_length,
+                                 size=3.0, color=(1., 0., 0., 1.))  # Red arrow for heading
+        
+            diff = self.target_pos - self.root_state[..., :3]
+            # print("heading_dir", heading_dir.squeeze(1).shape)
+            # Scale the arrow length for better visibility
+            arrow_length = 2.0
+            self.debug_draw.vector(self.root_state[..., :3], (diff / diff.norm(dim=-1, keepdim=True)) * arrow_length,
+                                 size=3.0, color=(0, 1.0, 0., 1.))  # Green arrow for heading
 
         # ---------Network Input II: Drone's internal states---------
         # a. distance info in horizontal and vertical plane
@@ -461,6 +467,9 @@ class NavigationEnv(IsaacEnv):
         distance_2d = rpos[..., :2].norm(dim=-1, keepdim=True)
         distance_z = rpos[..., 2].unsqueeze(-1)
         
+        if self.first_distance_flag == False:
+            self.last_distance = distance
+            self.first_distance_flag = True
         
         # b. unit direction vector to goal
         target_dir_2d = self.target_dir.clone()
@@ -552,7 +561,11 @@ class NavigationEnv(IsaacEnv):
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
         reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
-        
+        # 越靠近障碍物，reward越小
+        # 距离惩罚设计为-log(distance)，并且clip在一个合理的范围内，避免过大或者过小的梯度
+        # reward_safety_static = -torch.log((self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        # print("reward_safety_static", reward_safety_static)
+        # print("lidar_scan", self.lidar_scan)
 
         # b. safety reward for dynamic obstacles
         if (self.cfg.env_dyn.num_obstacles != 0):
@@ -561,15 +574,23 @@ class NavigationEnv(IsaacEnv):
         # c. velocity reward for goal direction
         vel_direction = rpos / distance.clamp_min(1e-6)
         reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)#.clip(max=2.0)
-        
+        # print("reward_vel", reward_vel)
+
+        # yaw reward for facing the goal direction
+        reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
+        # print("reward_yaw", reward_yaw)
+
+        reward_goal = (self.last_distance - distance).squeeze(-1)
+        # print("reward_goal", reward_goal)
         # d. smoothness reward for action smoothness
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
-        
+        # print("penalty_smooth", penalty_smooth)
         # e. height penalty reward for flying unnessarily high or low
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
         penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
 
+        # print("penalty_height", penalty_height)
 
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
@@ -577,9 +598,11 @@ class NavigationEnv(IsaacEnv):
         
         # Final reward calculation
         if (self.cfg.env_dyn.num_obstacles != 0):
-            self.reward = reward_vel + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+            self.reward = reward_vel + 1. + reward_safety_static*2.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
         else:
-            self.reward = reward_vel + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+            self.reward = reward_vel + 1. + reward_safety_static*2.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
+
+        self.last_distance = distance
 
         # Terminal reward
         # self.reward[collision] -= 50. # collision

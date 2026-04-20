@@ -4,6 +4,7 @@ import hydra
 import datetime
 import wandb
 import torch
+import glob
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
 from ppo import PPO
@@ -15,32 +16,40 @@ from utils import evaluate
 from torchrl.envs.utils import ExplorationType
 
 
+def get_latest_checkpoint():
+    """自动查找最新的checkpoint文件"""
+    wandb_dir = "/home/shuimujieming/NavRL/isaac-training/wandb"
+    
+    # 查找所有run目录，按修改时间排序
+    run_dirs = glob.glob(os.path.join(wandb_dir, "run-*"))
+    if not run_dirs:
+        raise FileNotFoundError(f"No wandb run directories found in {wandb_dir}")
+    
+    # 按修改时间排序，获取最新的
+    run_dirs.sort(key=os.path.getmtime, reverse=True)
+    latest_run_dir = run_dirs[0]
+    
+    # 查找该目录下的所有checkpoint文件
+    checkpoint_files = glob.glob(os.path.join(latest_run_dir, "files", "checkpoint_*.pt"))
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint files found in {latest_run_dir}/files")
+    
+    # 按数字大小排序，获取最新的checkpoint
+    checkpoint_files.sort(key=lambda x: int(x.split("checkpoint_")[-1].split(".")[0]), reverse=True)
+    latest_checkpoint = checkpoint_files[0]
+    
+    print(f"[NavRL]: Found latest checkpoint: {latest_checkpoint}")
+    return latest_checkpoint
+
+
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     # Simulation App
+    cfg.headless = False
+    cfg.env.num_envs = 1
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
-    # Use Wandb to monitor training
-    if (cfg.wandb.run_id is None):
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
-            mode=cfg.wandb.mode,
-            id=wandb.util.generate_id(),
-        )
-    else:
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
-            mode=cfg.wandb.mode,
-            id=cfg.wandb.run_id,
-            resume="must"
-        )
 
     # Navigation Training Environment
     from env import NavigationEnv
@@ -57,7 +66,7 @@ def main(cfg):
     # PPO Policy
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
 
-    checkpoint = "/home/shuimujieming/NavRL/isaac-training/wandb/run-20260420_031033-tqw0kzwg/files/checkpoint_final.pt"
+    checkpoint = get_latest_checkpoint()
     policy.load_state_dict(torch.load(checkpoint))
     
     # Episode Stats Collector
@@ -114,8 +123,6 @@ def main(cfg):
         info.update(eval_info)
         print("\n[NavRL]: evaluation done.")
         
-        # Update wand info
-        run.log(info)
 
 
         # # Save Model

@@ -22,6 +22,7 @@ import tf.transformations
 import time
 import threading
 import os
+from omni_drones.utils.torch import euler_to_quaternion, quat_axis,quaternion_to_euler
 
 class Navigation:
     def __init__(self, cfg):
@@ -356,7 +357,7 @@ class Navigation:
             # print("[nav-ros]: no safety running!")
             return action_vel_world   
     
-    def get_action(self, pos: torch.Tensor, vel: torch.Tensor, goal: torch.Tensor): # use world velocity
+    def get_action(self, pos: torch.Tensor, vel: torch.Tensor, goal: torch.Tensor , orientation: torch.Tensor): # use world velocity
         rpos = goal - pos
         distance = rpos.norm(dim=-1, keepdim=True)
         distance_2d = rpos[..., :2].norm(dim=-1, keepdim=True)
@@ -372,8 +373,13 @@ class Navigation:
         # "relative" velocity
         vel_g = vec_to_new_frame(vel, target_dir_2d).squeeze(0).squeeze(0) # goal velocity
 
+        quat = orientation
+        current_head_dir_2d = quat_axis(quat, axis=0)
+        current_head_dir_2d[..., 2] = 0
+        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1).unsqueeze(0)
+        drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel,], dim=-1).unsqueeze(0)
 
         # Lidar States
         lidar_scan = torch.tensor(self.raypoints, device=self.cfg.device)
@@ -417,7 +423,7 @@ class Navigation:
                     "state": drone_state,
                     "lidar": lidar_scan,
                     "direction": target_dir_2d,
-                    "dynamic_obstacle": dyn_obs_states
+                    "current_head_dir": current_head_dir_2d,
                 })
             })
         })
@@ -439,8 +445,8 @@ class Navigation:
                                                     obs["agents"]["observation"]["lidar"].size(), 
                                                     obs["agents"]["observation"]["direction"].cpu().numpy().flatten().tolist(),
                                                     obs["agents"]["observation"]["direction"].size(),
-                                                    obs["agents"]["observation"]["dynamic_obstacle"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["dynamic_obstacle"].size())
+                                                    obs["agents"]["observation"]["current_head_dir"].cpu().numpy().flatten().tolist(),
+                                                    obs["agents"]["observation"]["current_head_dir"].size())
                     vel_world = torch.tensor(response.action, device=self.cfg.device, dtype=torch.float).unsqueeze(0).unsqueeze(0)
                 except rospy.service.ServiceException as e:
                     print("[nav-ros]: Policy server err!")
@@ -502,8 +508,10 @@ class Navigation:
         vel_body = np.array([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z])
         vel_world = torch.tensor(rot @ vel_body, device=self.cfg.device, dtype=torch.float) # world vel
         
+        ori = torch.tensor([self.odom.pose.pose.orientation.w, self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z], device=self.cfg.device)
+
         # get RL action from model
-        cmd_vel_world = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
+        cmd_vel_world = self.get_action(pos, vel_world, ori).squeeze(0).squeeze(0).detach().cpu().numpy()        
         self.cmd_vel_world = cmd_vel_world.copy()
 
         # get safe action

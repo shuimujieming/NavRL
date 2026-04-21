@@ -139,163 +139,9 @@ class NavigationEnv(IsaacEnv):
         )
         terrain_importer = TerrainImporter(terrain_cfg)
 
-        if (self.cfg.env_dyn.num_obstacles == 0):
-            return
-        # Dynamic Obstacles
-        # NOTE: we use cuboid to represent 3D dynamic obstacles which can float in the air 
-        # and the long cylinder to represent 2D dynamic obstacles for which the drone can only pass in 2D 
-        # The width of the dynamic obstacles is divided into N_w=4 bins
-        # [[0, 0.25], [0.25, 0.50], [0.50, 0.75], [0.75, 1.0]]
-        # The height of the dynamic obstacles is divided into N_h=2 bins
-        # [[0, 0.5], [0.5, inf]] we want to distinguish 3D obstacles and 2d obstacles
-        N_w = 4 # number of width intervals between [0, 1]
-        N_h = 2 # number of height: current only support binary
-        max_obs_width = 1.0
-        self.max_obs_3d_height = 1.0
-        self.max_obs_2d_height = 5.0
-        self.dyn_obs_width_res = max_obs_width/float(N_w)
-        dyn_obs_category_num = N_w * N_h
-        self.dyn_obs_num_of_each_category = int(self.cfg.env_dyn.num_obstacles / dyn_obs_category_num)
-        self.cfg.env_dyn.num_obstacles = self.dyn_obs_num_of_each_category * dyn_obs_category_num # in case of the roundup error
-
-
-        # Dynamic obstacle info
-        self.dyn_obs_list = []
-        self.dyn_obs_state = torch.zeros((self.cfg.env_dyn.num_obstacles, 13), dtype=torch.float, device=self.cfg.device) # 13 is based on the states from sim, we only care the first three which is position
-        self.dyn_obs_state[:, 3] = 1. # Quaternion
-        self.dyn_obs_goal = torch.zeros((self.cfg.env_dyn.num_obstacles, 3), dtype=torch.float, device=self.cfg.device)
-        self.dyn_obs_origin = torch.zeros((self.cfg.env_dyn.num_obstacles, 3), dtype=torch.float, device=self.cfg.device)
-        self.dyn_obs_vel = torch.zeros((self.cfg.env_dyn.num_obstacles, 3), dtype=torch.float, device=self.cfg.device)
-        self.dyn_obs_step_count = 0 # dynamic obstacle motion step count
-        self.dyn_obs_size = torch.zeros((self.cfg.env_dyn.num_obstacles, 3), dtype=torch.float, device=self.device) # size of dynamic obstacles
-
-
-        # helper function to check pos validity for even distribution condition
-        def check_pos_validity(prev_pos_list, curr_pos, adjusted_obs_dist):
-            for prev_pos in prev_pos_list:
-                if (np.linalg.norm(curr_pos - prev_pos) <= adjusted_obs_dist):
-                    return False
-            return True            
-        
-        obs_dist = 2 * np.sqrt(self.map_range[0] * self.map_range[1] / self.cfg.env_dyn.num_obstacles) # prefered distance between each dynamic obstacle
-        curr_obs_dist = obs_dist
-        prev_pos_list = [] # for distance check
-        cuboid_category_num = cylinder_category_num = int(dyn_obs_category_num/N_h)
-        for category_idx in range(cuboid_category_num + cylinder_category_num):
-            # create all origins for 3D dynamic obstacles of this category (size)
-            for origin_idx in range(self.dyn_obs_num_of_each_category):
-                # random sample an origin until satisfy the evenly distributed condition
-                start_time = time.time()
-                while (True):
-                    ox = np.random.uniform(low=-self.map_range[0], high=self.map_range[0])
-                    oy = np.random.uniform(low=-self.map_range[1], high=self.map_range[1])
-                    if (category_idx < cuboid_category_num):
-                        oz = np.random.uniform(low=0.0, high=self.map_range[2]) 
-                    else:
-                        oz = self.max_obs_2d_height/2. # half of the height
-                    curr_pos = np.array([ox, oy])
-                    valid = check_pos_validity(prev_pos_list, curr_pos, curr_obs_dist)
-                    curr_time = time.time()
-                    if (curr_time - start_time > 0.1):
-                        curr_obs_dist *= 0.8
-                        start_time = time.time()
-                    if (valid):
-                        prev_pos_list.append(curr_pos)
-                        break
-                curr_obs_dist = obs_dist
-                origin = [ox, oy, oz]
-                self.dyn_obs_origin[origin_idx+category_idx*self.dyn_obs_num_of_each_category] = torch.tensor(origin, dtype=torch.float, device=self.cfg.device)     
-                self.dyn_obs_state[origin_idx+category_idx*self.dyn_obs_num_of_each_category, :3] = torch.tensor(origin, dtype=torch.float, device=self.cfg.device)                        
-                prim_utils.create_prim(f"/World/Origin{origin_idx+category_idx*self.dyn_obs_num_of_each_category}", "Xform", translation=origin)
-
-            # Spawn various sizes of dynamic obstacles 
-            if (category_idx < cuboid_category_num):
-                # spawn for 3D dynamic obstacles
-                obs_width = width = float(category_idx+1) * max_obs_width/float(N_w)
-                obs_height = self.max_obs_3d_height
-                cuboid_cfg = RigidObjectCfg(
-                    prim_path=f"/World/Origin{construct_input(category_idx*self.dyn_obs_num_of_each_category, (category_idx+1)*self.dyn_obs_num_of_each_category)}/Cuboid",
-                    spawn=sim_utils.CuboidCfg(
-                        size=[width, width, self.max_obs_3d_height],
-                        rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-                        mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
-                    ),
-                    init_state=RigidObjectCfg.InitialStateCfg(),
-                )
-                dynamic_obstacle = RigidObject(cfg=cuboid_cfg)
-            else:
-                radius = float(category_idx-cuboid_category_num+1) * max_obs_width/float(N_w) / 2.
-                obs_width = radius * 2
-                obs_height = self.max_obs_2d_height
-                # spawn for 2D dynamic obstacles
-                cylinder_cfg = RigidObjectCfg(
-                    prim_path=f"/World/Origin{construct_input(category_idx*self.dyn_obs_num_of_each_category, (category_idx+1)*self.dyn_obs_num_of_each_category)}/Cylinder",
-                    spawn=sim_utils.CylinderCfg(
-                        radius = radius,
-                        height = self.max_obs_2d_height, 
-                        rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-                        mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
-                    ),
-                    init_state=RigidObjectCfg.InitialStateCfg(),
-                )
-                dynamic_obstacle = RigidObject(cfg=cylinder_cfg)
-            self.dyn_obs_list.append(dynamic_obstacle)
-            self.dyn_obs_size[category_idx*self.dyn_obs_num_of_each_category:(category_idx+1)*self.dyn_obs_num_of_each_category] \
-                = torch.tensor([obs_width, obs_width, obs_height], dtype=torch.float, device=self.cfg.device)
-
-
-
-    def move_dynamic_obstacle(self):
-        # Step 1: Random sample new goals for required update dynamic obstacles
-        # Check whether the current dynamic obstacles need new goals
-        dyn_obs_goal_dist = torch.sqrt(torch.sum((self.dyn_obs_state[:, :3] - self.dyn_obs_goal)**2, dim=1)) if self.dyn_obs_step_count !=0 \
-            else torch.zeros(self.dyn_obs_state.size(0), device=self.cfg.device)
-        dyn_obs_new_goal_mask = dyn_obs_goal_dist < 0.5 # change to a new goal if less than the threshold
-        
-        # sample new goals in local range
-        num_new_goal = torch.sum(dyn_obs_new_goal_mask)
-        sample_x_local = -self.cfg.env_dyn.local_range[0] + 2. * self.cfg.env_dyn.local_range[0] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
-        sample_y_local = -self.cfg.env_dyn.local_range[1] + 2. * self.cfg.env_dyn.local_range[1] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
-        sample_z_local = -self.cfg.env_dyn.local_range[1] + 2. * self.cfg.env_dyn.local_range[2] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
-        sample_goal_local = torch.cat([sample_x_local, sample_y_local, sample_z_local], dim=1)
-    
-        # apply local goal to the global range
-        self.dyn_obs_goal[dyn_obs_new_goal_mask] = self.dyn_obs_origin[dyn_obs_new_goal_mask] + sample_goal_local
-        # clamp the range if out of the static env range
-        self.dyn_obs_goal[:, 0] = torch.clamp(self.dyn_obs_goal[:, 0], min=-self.map_range[0], max=self.map_range[0])
-        self.dyn_obs_goal[:, 1] = torch.clamp(self.dyn_obs_goal[:, 1], min=-self.map_range[1], max=self.map_range[1])
-        self.dyn_obs_goal[:, 2] = torch.clamp(self.dyn_obs_goal[:, 2], min=0., max=self.map_range[2])
-        self.dyn_obs_goal[int(self.dyn_obs_goal.size(0)/2):, 2] = self.max_obs_2d_height/2. # for 2d obstacles
-
-
-        # Step 2: Random sample velocity for roughly every 2 seconds
-        if (self.dyn_obs_step_count % int(2.0/self.cfg.sim.dt) == 0):
-            self.dyn_obs_vel_norm = self.cfg.env_dyn.vel_range[0] + (self.cfg.env_dyn.vel_range[1] \
-              - self.cfg.env_dyn.vel_range[0]) * torch.rand(self.dyn_obs_vel.size(0), 1, dtype=torch.float, device=self.cfg.device)
-            self.dyn_obs_vel = self.dyn_obs_vel_norm * \
-                (self.dyn_obs_goal - self.dyn_obs_state[:, :3])/torch.norm((self.dyn_obs_goal - self.dyn_obs_state[:, :3]), dim=1, keepdim=True)
-
-        # Step 3: Calculate new position update for current timestep
-        self.dyn_obs_state[:, :3] += self.dyn_obs_vel * self.cfg.sim.dt
-
-
-        # Step 4: Update Visualized Location in Simulation
-        for category_idx, dynamic_obstacle in enumerate(self.dyn_obs_list):
-            dynamic_obstacle.write_root_state_to_sim(self.dyn_obs_state[category_idx*self.dyn_obs_num_of_each_category:(category_idx+1)*self.dyn_obs_num_of_each_category]) 
-            dynamic_obstacle.write_data_to_sim()
-            dynamic_obstacle.update(self.cfg.sim.dt)
-
-        self.dyn_obs_step_count += 1
-
 
     def _set_specs(self):
-        observation_dim = 8
-        num_dim_each_dyn_obs_state = 10
-
+        observation_dim = 11
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -303,7 +149,7 @@ class NavigationEnv(IsaacEnv):
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+                    "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                 }),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -340,9 +186,10 @@ class NavigationEnv(IsaacEnv):
             "reward_pos": UnboundedContinuousTensorSpec(1),
             "reward_head": UnboundedContinuousTensorSpec(1),
             "reward_reach": UnboundedContinuousTensorSpec(1),
-            "reward_vel": UnboundedContinuousTensorSpec(1),
-            "penalty_smooth": UnboundedContinuousTensorSpec(1),
-            "penalty_height": UnboundedContinuousTensorSpec(1),
+            "penalty_vel": UnboundedContinuousTensorSpec(1),
+            "penalty_acc": UnboundedContinuousTensorSpec(1),
+            "penalty_collision": UnboundedContinuousTensorSpec(1),
+
         }).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
@@ -431,8 +278,6 @@ class NavigationEnv(IsaacEnv):
         self.drone.apply_action(actions) 
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            self.move_dynamic_obstacle()
         self.lidar.update(self.dt)
     
     # get current states/observation
@@ -488,89 +333,29 @@ class NavigationEnv(IsaacEnv):
         current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
         rpos_clipped = rpos / distance.clamp(1e-6) # unit vector: start to goal direction
-        rpos_clipped[...,2] = 0. # only care about the horizontal direction for the input, we will add vertical distance as a separate input
+        # rpos_clipped[...,2] = 0. # only care about the horizontal direction for the input, we will add vertical distance as a separate input
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
         # print("rpos_clipped_g", rpos_clipped_g)
 
         # c. velocity in the goal frame
         vel_w = self.root_state[..., 7:10] # world vel
-        vel_w[...,2] = 0. # only care about horizontal velocity for the input, we will add vertical velocity as a separate input
+        # vel_w[...,2] = 0. # only care about horizontal velocity for the input, we will add vertical velocity as a separate input
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
         # final drone's internal states
-        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1).squeeze(1)
+        drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
 
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            # ---------Network Input III: Dynamic obstacle states--------
-            # ------------------------------------------------------------
-            # a. Closest N obstacles relative position in the goal frame 
-            # Find the N closest and within range obstacles for each drone
-            dyn_obs_pos_expanded = self.dyn_obs_state[..., :3].unsqueeze(0).repeat(self.num_envs, 1, 1)
-            dyn_obs_rpos_expanded = dyn_obs_pos_expanded[..., :3] - self.root_state[..., :3] 
-            dyn_obs_rpos_expanded[:, int(self.dyn_obs_state.size(0)/2):, 2] = 0.
-            dyn_obs_distance_2d = torch.norm(dyn_obs_rpos_expanded[..., :2], dim=2)  # Shape: (1000, 40). calculate 2d distance to each obstacle for all drones
-            _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.cfg.algo.feature_extractor.dyn_obs_num, dim=1, largest=False) # pick top N closest obstacle index
-            dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.lidar_range
-
-            # relative distance of obstacles in the goal frame
-            closest_dyn_obs_rpos = torch.gather(dyn_obs_rpos_expanded, 1, closest_dyn_obs_idx.unsqueeze(-1).expand(-1, -1, 3))
-            closest_dyn_obs_rpos_g = vec_to_new_frame(closest_dyn_obs_rpos, target_dir_2d) 
-            closest_dyn_obs_rpos_g[dyn_obs_range_mask] = 0. # exclude out of range obstacles
-            closest_dyn_obs_distance = closest_dyn_obs_rpos.norm(dim=-1, keepdim=True)
-            closest_dyn_obs_distance_2d = closest_dyn_obs_rpos_g[..., :2].norm(dim=-1, keepdim=True)
-            closest_dyn_obs_distance_z = closest_dyn_obs_rpos_g[..., 2].unsqueeze(-1)
-            closest_dyn_obs_rpos_gn = closest_dyn_obs_rpos_g / closest_dyn_obs_distance.clamp(1e-6)
-
-            # b. Velocity in the goal frame for the dynamic obstacles
-            closest_dyn_obs_vel = self.dyn_obs_vel[closest_dyn_obs_idx]
-            closest_dyn_obs_vel[dyn_obs_range_mask] = 0.
-            closest_dyn_obs_vel_g = vec_to_new_frame(closest_dyn_obs_vel, target_dir_2d) 
-
-            # c. Size of dynamic obstacles in category
-            closest_dyn_obs_size = self.dyn_obs_size[closest_dyn_obs_idx] # the acutal size
-
-            closest_dyn_obs_width = closest_dyn_obs_size[..., 0].unsqueeze(-1)
-            closest_dyn_obs_width_category = closest_dyn_obs_width / self.dyn_obs_width_res - 1. # convert to category: [0, 1, 2, 3]
-            closest_dyn_obs_width_category[dyn_obs_range_mask] = 0.
-
-            closest_dyn_obs_height = closest_dyn_obs_size[..., 2].unsqueeze(-1)
-            closest_dyn_obs_height_category = torch.where(closest_dyn_obs_height > self.max_obs_3d_height, torch.tensor(0.0), closest_dyn_obs_height)
-            closest_dyn_obs_height_category[dyn_obs_range_mask] = 0.
-
-            # concatenate all for dynamic obstacles
-            # dyn_obs_states = torch.cat([closest_dyn_obs_rpos_g, closest_dyn_obs_vel_g, closest_dyn_obs_width_category, closest_dyn_obs_height_category], dim=-1).unsqueeze(1)
-            dyn_obs_states = torch.cat([closest_dyn_obs_rpos_gn, closest_dyn_obs_distance_2d, closest_dyn_obs_distance_z, closest_dyn_obs_vel_g, closest_dyn_obs_width_category, closest_dyn_obs_height_category], dim=-1).unsqueeze(1)
-
-            # check dynamic obstacle collision for later reward
-            closest_dyn_obs_distance_2d_collsion = closest_dyn_obs_rpos[..., :2].norm(dim=-1, keepdim=True)
-            closest_dyn_obs_distance_2d_collsion[dyn_obs_range_mask] = float('inf')
-            closest_dyn_obs_distance_zn_collision = closest_dyn_obs_rpos[..., 2].unsqueeze(-1).norm(dim=-1, keepdim=True)
-            closest_dyn_obs_distance_zn_collision[dyn_obs_range_mask] = float('inf')
-            dynamic_collision_2d = closest_dyn_obs_distance_2d_collsion <= (closest_dyn_obs_width/2. + 0.3)
-            dynamic_collision_z = closest_dyn_obs_distance_zn_collision <= (closest_dyn_obs_height/2. + 0.3)
-            dynamic_collision_each = dynamic_collision_2d & dynamic_collision_z
-            dynamic_collision = torch.any(dynamic_collision_each, dim=1)
-
-            # distance to dynamic obstacle for reward calculation (not 100% correct in math but should be good enough for approximation)
-            closest_dyn_obs_distance_reward = closest_dyn_obs_rpos.norm(dim=-1) - closest_dyn_obs_size[..., 0]/2. # for those 2D obstacle, z distance will not be considered
-            closest_dyn_obs_distance_reward[dyn_obs_range_mask] = self.cfg.sensor.lidar_range
-            
-        else:
-            dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
-            dynamic_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
-            
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
             "lidar": self.lidar_scan,
-            "direction": current_head_dir_2d,
-            "dynamic_obstacle": dyn_obs_states
+            "direction": target_dir_2d,
+            "current_head_dir_2d": current_head_dir_2d,
         }
-
 
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
-        reward_safety_static = 0.0 * torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
         # 越靠近障碍物，reward越小
         # 距离惩罚设计为-log(distance)，并且clip在一个合理的范围内，避免过大或者过小的梯度
         # reward_safety_static = -torch.log((self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
@@ -578,11 +363,7 @@ class NavigationEnv(IsaacEnv):
         # print("lidar_scan", self.lidar_scan)
 
         # b. safety reward for dynamic obstacles
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
-
-        reward_pos = 10.0 * (self.last_distance - distance).squeeze(-1)
-
+        reward_pos = (self.last_distance - distance).squeeze(-1)
 
         # yaw reward for facing the goal direction
         quat = self.root_state[..., 3:7]
@@ -601,50 +382,53 @@ class NavigationEnv(IsaacEnv):
         w_t[d_g < 1.0] = d_g[d_g < 1.0]
 
 
+        d_tt = (self.last_distance - distance).squeeze(-1)
+
         diff_distance = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        diff_distance[reward_pos > 0] = reward_pos[reward_pos > 0]
+        diff_distance[d_tt > 0] = d_tt[d_tt > 0]
 
         g_t = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         g_t[diff_distance > 0.001] = 1.0
  
-        reward_head = b_t * w_t * g_t  * 3.0  
+        reward_head = b_t * w_t * g_t 
 
         reward_reach = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        reward_reach[distance.squeeze(-1) < 0.5] = 1.0 * 100.0
+        reward_reach[distance.squeeze(-1) < 0.5] = 1.0
 
         vel_direction = rpos / distance.clamp_min(1e-6)
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)* 1.0#.clip(max=2.0) 
-        # print("reward_vel", reward_vel)
+        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)#.clip(max=2.0) 
 
+        penalty_vel = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+        penalty_vel[self.drone.vel_b[..., 0] > 2.0] = (self.drone.vel_b[..., 0] - 2.0)[self.drone.vel_b[..., 0] > 2.0]
+        penalty_vel[self.drone.vel_b[..., 0] < 0.2] = (0.2 - self.drone.vel_b[..., 0])[self.drone.vel_b[..., 0] < 0.2]
+        penalty_vel = 0.0 * penalty_vel 
         # reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
         # print("reward_yaw", reward_yaw)
+        penalty_acc = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1) 
 
         # print("reward_goal", reward_goal)
         # d. smoothness reward for action smoothness
-        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1) *(-1.0)
+        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
         # print("penalty_smooth", penalty_smooth)
         # e. height penalty reward for flying unnessarily high or low
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
         penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
         
-        penalty_height = penalty_height * (-1.0)
         # print("penalty_height", penalty_height)
 
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
-        collision = static_collision | dynamic_collision
+        collision = static_collision
         
-        reward_collision = static_collision.float() * (-100.0)
-        print("reward_collision", reward_collision)
+        penalty_collision = static_collision
+        # print("reward_collision", reward_collision)
         
-        # Final reward calculation
-        # if (self.cfg.env_dyn.num_obstacles != 0):
-        #     self.reward = reward_vel + 1. + reward_safety_static*2.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
-        # else:
-        #     self.reward = reward_vel*2.0 + reward_safety_static*2.0 - penalty_smooth * 2.0 - penalty_height * 4.0 + reward_yaw*8.0 + reward_goal* 8.0
-        self.reward = reward_safety_static + reward_pos + reward_head+ reward_reach  + reward_vel + penalty_smooth  + penalty_height 
+        self.reward = reward_safety_static *(1.0) + reward_pos*(10.0) + reward_head*(5.0) + reward_reach *(100.0) + reward_vel + penalty_collision *(-100.0)+ penalty_height* (-5.0)
         
+        # self.reward = reward_vel + 1. + reward_safety_static*2.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
+        # self.reward = reward_vel + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+
         self.last_distance = distance
 
         # Terminal reward
@@ -654,7 +438,7 @@ class NavigationEnv(IsaacEnv):
         reach_goal = (distance.squeeze(-1) < 0.5)
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
-        self.terminated = below_bound | above_bound | collision
+        self.terminated = collision | reach_goal | below_bound | above_bound
         self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
 
         # update previous velocity for smoothness calculation in the next ieteration
@@ -670,9 +454,9 @@ class NavigationEnv(IsaacEnv):
         self.stats["reward_pos"] = reward_pos
         self.stats["reward_head"] = reward_head
         self.stats["reward_reach"] = reward_reach
-        self.stats["reward_vel"] = reward_vel
-        self.stats["penalty_smooth"] = penalty_smooth
-        self.stats["penalty_height"] = penalty_height
+        self.stats["penalty_vel"] = penalty_vel
+        self.stats["penalty_acc"] = penalty_acc
+        self.stats["penalty_collision"]= penalty_collision.float()
 
         return TensorDict({
             "agents": TensorDict(

@@ -34,13 +34,13 @@ class PPO(TensorDictModuleBase):
         # Feature extractor
         self.feature_extractor = TensorDictSequential(
             TensorDictModule(feature_extractor_network, [("agents", "observation", "lidar")], ["_cnn_feature"]),
-            TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
-            CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False), 
             TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
         ).to(self.device)
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
+        self.action_dim = 3 # only control x, z velocity and yaw rate
         self.actor = ProbabilisticActor(
             TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
             in_keys=["alpha", "beta"],
@@ -86,6 +86,21 @@ class PPO(TensorDictModuleBase):
 
         # Cooridnate change: transform local to world
         actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
-        actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
-        tensordict["agents", "action"] = actions_world
+        # print("actions: ", actions)
+        # print("actions shape: ", actions.shape)
+
+        actions_xyz = torch.zeros((*actions.shape[:-1], 3), device=actions.device)
+        actions_xyz[..., [0, 2]] = actions[..., [0, 1]] # map the first two dimension of action to x and z velocity
+        # print("actions xyz: ", actions_xyz)
+
+        # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
+        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
+        # print("actions world: ", actions_world)
+
+        actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)
+        actions_target[..., :3] = actions_world
+        actions_target[..., 3] = actions[..., 2].unsqueeze(1) # yaw rate
+        # print("actions target: ", actions_target)
+        # xyz yaw
+        tensordict["agents", "action"] = actions_target
         return tensordict

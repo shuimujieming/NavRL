@@ -6,8 +6,8 @@ from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDict
 from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
-from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
-from omni_drones.utils.torch import quaternion_to_euler
+from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world ,vec_to_new_frame
+from omni_drones.utils.torch import quaternion_to_euler,quat_axis
 
 
 
@@ -26,18 +26,11 @@ class PPO(TensorDictModuleBase):
             Rearrange("n c w h -> n (c w h)"),
             nn.LazyLinear(128), nn.LayerNorm(128),
         ).to(self.device)
-        
-        # Dynamic obstacle information extractor
-        dynamic_obstacle_network = nn.Sequential(
-            Rearrange("n c w h -> n (c w h)"),
-            make_mlp([128, 64])
-        ).to(self.device)
 
         # Feature extractor
         self.feature_extractor = TensorDictSequential(
             TensorDictModule(feature_extractor_network, [("agents", "observation", "lidar")], ["_cnn_feature"]),
-            TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
-            CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False), 
             TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
         ).to(self.device)
 
@@ -95,25 +88,15 @@ class PPO(TensorDictModuleBase):
 
         actions_xyz = torch.zeros((*actions.shape[:-1], 3), device=actions.device)
         actions_xyz[..., [0, 2]] = actions[..., [0, 1]] # map the first two dimension of action to x and z velocity
-        # actions_xyz[...,0] = 1.0
         # print("actions xyz: ", actions_xyz)
 
-        # quat = tensordict[("info", "drone_state")][..., 3:7]
         # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
-
-
-        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "direction"])
+        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
         # print("actions world: ", actions_world)
 
         actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)
         actions_target[..., :3] = actions_world
         actions_target[..., 3] = actions[..., 2].unsqueeze(1) # yaw rate
-        # if self.first_done < 800:
-        #     first_yaw = 1.57
-        #     self.first_done += 1
-        # else:
-        #     first_yaw = 0
-        # actions_target[..., 3] = 1.0
         # print("actions target: ", actions_target)
 
         tensordict["agents", "action"] = actions_target

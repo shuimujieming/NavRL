@@ -231,10 +231,7 @@ class VelController(Transform):
             spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(4,), device=action_spec.device)
         else:
             spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(3,), device=action_spec.device)
-        
-        print("action spec: ", action_spec.shape)
-        print("spec: ", action_spec)
-
+            
         input_spec[("full_action_spec", *self.action_key)] = spec
         return input_spec
     

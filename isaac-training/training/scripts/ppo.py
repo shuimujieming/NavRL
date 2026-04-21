@@ -113,7 +113,7 @@ class PPO(TensorDictModuleBase):
         #     self.first_done += 1
         # else:
         #     first_yaw = 0
-        # actions_target[..., 3] = first_yaw
+        # actions_target[..., 3] = 1.0
         # print("actions target: ", actions_target)
 
         tensordict["agents", "action"] = actions_target

@@ -47,7 +47,7 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 def main(cfg):
     # Simulation App
     cfg.headless = False
-    cfg.env.num_envs = 1
+    cfg.env.num_envs = 2
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
 
@@ -122,17 +122,7 @@ def main(cfg):
         env.reset()
         info.update(eval_info)
         print("\n[NavRL]: evaluation done.")
-        
-
-
-        # # Save Model
-        # if i % cfg.save_interval == 0:
-        #     ckpt_path = os.path.join(run.dir, f"checkpoint_{i}.pt")
-        #     torch.save(policy.state_dict(), ckpt_path)
-        #     print("[NavRL]: model saved at training step: ", i)
-
-    # ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-    # torch.save(policy.state_dict(), ckpt_path)
+    
     wandb.finish()
     sim_app.close()
 

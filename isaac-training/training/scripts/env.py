@@ -8,7 +8,7 @@ import omni.isaac.orbit.sim as sim_utils
 from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
 from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
-from omni_drones.utils.torch import euler_to_quaternion, quat_axis
+from omni_drones.utils.torch import euler_to_quaternion, quat_axis,quaternion_to_euler
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
 from omni.isaac.core.utils.viewports import set_camera_view
 from utils import vec_to_new_frame, vec_to_world, construct_input
@@ -336,6 +336,13 @@ class NavigationEnv(IsaacEnv):
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
+            "reward_safety_static": UnboundedContinuousTensorSpec(1),
+            "reward_pos": UnboundedContinuousTensorSpec(1),
+            "reward_head": UnboundedContinuousTensorSpec(1),
+            "reward_reach": UnboundedContinuousTensorSpec(1),
+            "reward_vel": UnboundedContinuousTensorSpec(1),
+            "penalty_smooth": UnboundedContinuousTensorSpec(1),
+            "penalty_height": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
@@ -563,7 +570,7 @@ class NavigationEnv(IsaacEnv):
 
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
-        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        reward_safety_static = 0.0 * torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
         # 越靠近障碍物，reward越小
         # 距离惩罚设计为-log(distance)，并且clip在一个合理的范围内，避免过大或者过小的梯度
         # reward_safety_static = -torch.log((self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
@@ -574,37 +581,70 @@ class NavigationEnv(IsaacEnv):
         if (self.cfg.env_dyn.num_obstacles != 0):
             reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
 
-        # c. velocity reward for goal direction
-        vel_direction = rpos / distance.clamp_min(1e-6)
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)#.clip(max=2.0)
-        # print("reward_vel", reward_vel)
+        reward_pos = 10.0 * (self.last_distance - distance).squeeze(-1)
+
 
         # yaw reward for facing the goal direction
-        reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
+        quat = self.root_state[..., 3:7]
+        current_yaw = quaternion_to_euler(quat)[..., 2]
+        diff = self.target_pos - self.root_state[..., :3]
+        target_yaw = torch.atan2(diff[..., 1], diff[..., 0])
+
+        diff_yaw = target_yaw - current_yaw
+        diff_yaw = (diff_yaw + np.pi) % (2 * np.pi) - np.pi
+
+        b_t = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+        b_t[torch.cos(diff_yaw[..., ]) > 0] = torch.cos(diff_yaw[..., ])[torch.cos(diff_yaw[..., ]) > 0]
+        
+        d_g = distance.squeeze(-1) / 48.0
+        w_t= torch.ones(self.num_envs, 1, device=self.cfg.device)
+        w_t[d_g < 1.0] = d_g[d_g < 1.0]
+
+
+        diff_distance = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+        diff_distance[reward_pos > 0] = reward_pos[reward_pos > 0]
+
+        g_t = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+        g_t[diff_distance > 0.001] = 1.0
+ 
+        reward_head = b_t * w_t * g_t  * 3.0  
+
+        reward_reach = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+        reward_reach[distance.squeeze(-1) < 0.5] = 1.0 * 100.0
+
+        vel_direction = rpos / distance.clamp_min(1e-6)
+        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)* 1.0#.clip(max=2.0) 
+        # print("reward_vel", reward_vel)
+
+        # reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
         # print("reward_yaw", reward_yaw)
 
-        reward_goal = (self.last_distance - distance).squeeze(-1)
         # print("reward_goal", reward_goal)
         # d. smoothness reward for action smoothness
-        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
+        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1) *(-1.0)
         # print("penalty_smooth", penalty_smooth)
         # e. height penalty reward for flying unnessarily high or low
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
         penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
-
+        
+        penalty_height = penalty_height * (-1.0)
         # print("penalty_height", penalty_height)
 
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
         collision = static_collision | dynamic_collision
         
+        reward_collision = static_collision.float() * (-100.0)
+        print("reward_collision", reward_collision)
+        
         # Final reward calculation
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            self.reward = reward_vel + 1. + reward_safety_static*2.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
-        else:
-            self.reward = reward_vel*2.0 + reward_safety_static*2.0 - penalty_smooth * 2.0 - penalty_height * 4.0 + reward_yaw*8.0 + reward_goal* 8.0
-
+        # if (self.cfg.env_dyn.num_obstacles != 0):
+        #     self.reward = reward_vel + 1. + reward_safety_static*2.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
+        # else:
+        #     self.reward = reward_vel*2.0 + reward_safety_static*2.0 - penalty_smooth * 2.0 - penalty_height * 4.0 + reward_yaw*8.0 + reward_goal* 8.0
+        self.reward = reward_safety_static + reward_pos + reward_head+ reward_reach  + reward_vel + penalty_smooth  + penalty_height 
+        
         self.last_distance = distance
 
         # Terminal reward
@@ -626,6 +666,13 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
+        self.stats["reward_safety_static"] = reward_safety_static
+        self.stats["reward_pos"] = reward_pos
+        self.stats["reward_head"] = reward_head
+        self.stats["reward_reach"] = reward_reach
+        self.stats["reward_vel"] = reward_vel
+        self.stats["penalty_smooth"] = penalty_smooth
+        self.stats["penalty_height"] = penalty_height
 
         return TensorDict({
             "agents": TensorDict(

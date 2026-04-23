@@ -10,32 +10,6 @@ from navigation_runner.srv import GetPolicyInference
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from tensordict.tensordict import TensorDict
 
-
-def get_latest_checkpoint():
-    """自动查找最新的checkpoint文件"""
-    wandb_dir = "/home/shuimujieming/NavRL/isaac-training/wandb"
-    
-    # 查找所有run目录，按修改时间排序
-    run_dirs = glob.glob(os.path.join(wandb_dir, "run-*"))
-    if not run_dirs:
-        raise FileNotFoundError(f"No wandb run directories found in {wandb_dir}")
-    
-    # 按修改时间排序，获取最新的
-    run_dirs.sort(key=os.path.getmtime, reverse=True)
-    latest_run_dir = run_dirs[0]
-    
-    # 查找该目录下的所有checkpoint文件
-    checkpoint_files = glob.glob(os.path.join(latest_run_dir, "files", "checkpoint_*.pt"))
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoint files found in {latest_run_dir}/files")
-    
-    # 按数字大小排序，获取最新的checkpoint
-    checkpoint_files.sort(key=lambda x: int(x.split("checkpoint_")[-1].split(".")[0]), reverse=True)
-    latest_checkpoint = checkpoint_files[0]
-    
-    print(f"[NavRL]: Found latest checkpoint: {latest_checkpoint}")
-    return latest_checkpoint
-
 class policy_server:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -54,7 +28,8 @@ class policy_server:
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.cfg.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
-                    "current_head_dir": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),}),
+                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.cfg.device),
+                }),
             }).expand(1)
         }, shape=[1], device=self.cfg.device)
 
@@ -68,7 +43,8 @@ class policy_server:
         policy = PPO(self.cfg.algo, observation_spec, action_spec, self.cfg.device)
 
 
-        checkpoint = get_latest_checkpoint()
+        checkpoint = "/home/zhefan/rl_ws/src/nav-ros/navigation_runner/scripts/ckpts/120obs-21000.pt"
+
         policy.load_state_dict(torch.load(checkpoint))
         print("[policy server]: model init success!")
         return policy
@@ -79,7 +55,7 @@ class policy_server:
         drone_state = torch.tensor(req.state, device=self.cfg.device).view(req.state_shape)
         lidar_scan = torch.tensor(req.lidar, device=self.cfg.device).view(req.lidar_shape)
         target_dir_2d = torch.tensor(req.direction, device=self.cfg.device).view(req.direction_shape)
-        current_head_dir_2d = torch.tensor(req.current_head_dir, device=self.cfg.device).view(req.current_head_dir_shape)
+        dyn_obs_states = torch.tensor(req.dynamic_obstacle, device=self.cfg.device).view(req.dynamic_obstacle_shape)
         
         obs = TensorDict({
             "agents": TensorDict({
@@ -87,7 +63,7 @@ class policy_server:
                     "state": drone_state,
                     "lidar": lidar_scan,
                     "direction": target_dir_2d,
-                    "current_head_dir": current_head_dir_2d,
+                    "dynamic_obstacle": dyn_obs_states
                 })
             })
         })

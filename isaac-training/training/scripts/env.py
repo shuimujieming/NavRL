@@ -17,6 +17,7 @@ import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
 from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
 import time
+import torch.distributions as D
 
 class NavigationEnv(IsaacEnv):
 
@@ -62,6 +63,11 @@ class NavigationEnv(IsaacEnv):
         self.lidar._initialize_impl()
         self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams) 
         
+        self.init_rpy_dist = D.Uniform(
+            torch.tensor([0.0, 0.0, 0.], device=self.device) * torch.pi,
+            torch.tensor([0.0, 0.0, 2.], device=self.device) * torch.pi
+        )
+
         # start and target 
         with torch.device(self.device):
             # self.start_pos = torch.zeros(self.num_envs, 1, 3)
@@ -259,12 +265,15 @@ class NavigationEnv(IsaacEnv):
         self.target_dir[env_ids] = self.target_pos[env_ids] - pos
 
         # Coordinate change: after reset, the drone's facing direction should face the current goal
-        rpy = torch.zeros(len(env_ids), 1, 3, device=self.device)
-        diff = self.target_pos[env_ids] - pos
-        facing_yaw = torch.atan2(diff[..., 1], diff[..., 0])
-        rpy[..., 2] = facing_yaw
+        # rpy = torch.zeros(len(env_ids), 1, 3, device=self.device)
+        # diff = self.target_pos[env_ids] - pos
+        # facing_yaw = torch.atan2(diff[..., 1], diff[..., 0])
+        # rpy[..., 2] = facing_yaw
+        # rot = euler_to_quaternion(rpy)
 
+        rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         rot = euler_to_quaternion(rpy)
+    
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
@@ -343,6 +352,7 @@ class NavigationEnv(IsaacEnv):
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
         # final drone's internal states
+        # drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
         drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
 
         # -----------------Network Input Final--------------

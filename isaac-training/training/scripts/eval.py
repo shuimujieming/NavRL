@@ -34,8 +34,8 @@ def get_latest_checkpoint():
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoint files found in {latest_run_dir}/files")
     
-    # 按数字大小排序，获取最新的checkpoint
-    checkpoint_files.sort(key=lambda x: int(x.split("checkpoint_")[-1].split(".")[0]), reverse=True)
+    # 按时间顺序排序，获取最新的checkpoint
+    checkpoint_files.sort(key=os.path.getmtime, reverse=True)
     latest_checkpoint = checkpoint_files[0]
     
     print(f"[NavRL]: Found latest checkpoint: {latest_checkpoint}")
@@ -47,7 +47,7 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 def main(cfg):
     # Simulation App
     cfg.headless = False
-    cfg.env.num_envs = 2
+    cfg.env.num_envs = 1
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
 

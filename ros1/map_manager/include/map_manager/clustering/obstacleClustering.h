@@ -11,6 +11,7 @@
 #include <thread>
 #include <Eigen/Eigen>
 #include <math.h>
+#include <memory>
 
 struct pointCluster{
 	std::vector<Eigen::Vector3d> points;

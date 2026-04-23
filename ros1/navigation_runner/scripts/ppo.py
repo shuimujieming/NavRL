@@ -24,12 +24,6 @@ class PPO(TensorDictModuleBase):
             Rearrange("n c w h -> n (c w h)"),
             nn.LazyLinear(128), nn.LayerNorm(128),
         ).to(self.device)
-        
-        # Dynamic obstacle information extractor
-        dynamic_obstacle_network = nn.Sequential(
-            Rearrange("n c w h -> n (c w h)"),
-            make_mlp([128, 64])
-        ).to(self.device)
 
         # Feature extractor
         self.feature_extractor = TensorDictSequential(
@@ -40,6 +34,7 @@ class PPO(TensorDictModuleBase):
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
+        print("action dim: ", self.action_dim)
         self.action_dim = 3 # only control x, z velocity and yaw rate
         self.actor = ProbabilisticActor(
             TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
@@ -86,21 +81,19 @@ class PPO(TensorDictModuleBase):
 
         # Cooridnate change: transform local to world
         actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
-        # print("actions: ", actions)
+        print("actions: ", actions)
         # print("actions shape: ", actions.shape)
 
+        
         actions_xyz = torch.zeros((*actions.shape[:-1], 3), device=actions.device)
         actions_xyz[..., [0, 2]] = actions[..., [0, 1]] # map the first two dimension of action to x and z velocity
         # print("actions xyz: ", actions_xyz)
 
-        # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
-        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
-        # print("actions world: ", actions_world)
-
         actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)
-        actions_target[..., :3] = actions_world
+        actions_target[..., :3] = actions_xyz
         actions_target[..., 3] = actions[..., 2].unsqueeze(1) # yaw rate
         # print("actions target: ", actions_target)
-        # xyz yaw
+
         tensordict["agents", "action"] = actions_target
+
         return tensordict

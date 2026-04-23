@@ -23,6 +23,33 @@ import time
 import threading
 import os
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis,quaternion_to_euler
+import glob
+
+def get_latest_checkpoint():
+    """自动查找最新的checkpoint文件"""
+    wandb_dir = "/home/shuimujieming/NavRL/isaac-training/wandb"
+    
+    # 查找所有run目录，按修改时间排序
+    run_dirs = glob.glob(os.path.join(wandb_dir, "run-*"))
+    if not run_dirs:
+        raise FileNotFoundError(f"No wandb run directories found in {wandb_dir}")
+    
+    # 按修改时间排序，获取最新的
+    run_dirs.sort(key=os.path.getmtime, reverse=True)
+    latest_run_dir = run_dirs[0]
+    
+    # 查找该目录下的所有checkpoint文件
+    checkpoint_files = glob.glob(os.path.join(latest_run_dir, "files", "checkpoint_*.pt"))
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint files found in {latest_run_dir}/files")
+    
+    # 按时间顺序排序，获取最新的checkpoint
+    checkpoint_files.sort(key=os.path.getmtime, reverse=True)
+    latest_checkpoint = checkpoint_files[0]
+    
+    print(f"[NavRL]: Found latest checkpoint: {latest_checkpoint}")
+    return latest_checkpoint
+
 
 class Navigation:
     def __init__(self, cfg):
@@ -85,7 +112,7 @@ class Navigation:
         self.takeoff()
   
     def init_model(self):
-        observation_dim = 8
+        observation_dim = 11
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -93,7 +120,7 @@ class Navigation:
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.cfg.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.cfg.device),
+                    "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
                 }),
             }).expand(1)
         }, shape=[1], device=self.cfg.device)
@@ -107,10 +134,9 @@ class Navigation:
 
         policy = PPO(self.cfg.algo, observation_spec, action_spec, self.cfg.device)
 
-        file_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ckpts")
-        checkpoint = "navrl_checkpoint.pt"
+        checkpoint = get_latest_checkpoint()
 
-        policy.load_state_dict(torch.load(os.path.join(file_dir, checkpoint), map_location=self.cfg.device))
+        policy.load_state_dict(torch.load(checkpoint, map_location=self.cfg.device))
         return policy
 
     def takeoff(self):
@@ -237,7 +263,13 @@ class Navigation:
         if not self.odom_received or not self.goal_received:
             return
         pos = np.array([self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z])
-        start_angle = np.arctan2(self.target_dir[1].cpu().numpy(), self.target_dir[0].cpu().numpy())
+
+        orientation = torch.tensor([self.odom.pose.pose.orientation.w,self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z], device=self.cfg.device)
+        
+        current_head_dir_2d = quat_axis(orientation.unsqueeze(0), axis=0)
+        start_angle = np.arctan2(current_head_dir_2d[...,1].cpu().numpy(), current_head_dir_2d[...,0].cpu().numpy())
+        # start_angle = np.arctan2(self.target_dir[1].cpu().numpy(), self.target_dir[0].cpu().numpy())
+
         self.raypoints = self.get_raycast(pos, start_angle)
 
     def dynamic_obstacle_callback(self, event):
@@ -357,8 +389,16 @@ class Navigation:
             # print("[nav-ros]: no safety running!")
             return action_vel_world   
     
-    def get_action(self, pos: torch.Tensor, vel: torch.Tensor, goal: torch.Tensor , orientation: torch.Tensor): # use world velocity
+    def get_action(self, pos: torch.Tensor, vel: torch.Tensor, goal: torch.Tensor): # use world velocity
         rpos = goal - pos
+
+        orientation = torch.tensor([ self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z,self.odom.pose.pose.orientation.w], device=self.cfg.device)
+
+        # current robot heading direction in the horizontal plane
+        current_head_dir_2d = quat_axis(orientation.unsqueeze(0), axis=0)
+        current_head_dir_2d[..., 2] = 0
+        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
         distance = rpos.norm(dim=-1, keepdim=True)
         distance_2d = rpos[..., :2].norm(dim=-1, keepdim=True)
         distance_z = rpos[..., 2].unsqueeze(-1)
@@ -371,21 +411,20 @@ class Navigation:
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d).squeeze(0).squeeze(0)
 
         # "relative" velocity
-        vel_g = vec_to_new_frame(vel, target_dir_2d).squeeze(0).squeeze(0) # goal velocity
-
-        quat = orientation
-        current_head_dir_2d = quat_axis(quat, axis=0)
-        current_head_dir_2d[..., 2] = 0
-        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        vel_w = vel
+        vel_g = vec_to_new_frame(vel_w, target_dir_2d).squeeze(0).squeeze(0) # goal velocity
 
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel,], dim=-1).unsqueeze(0)
+        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g, current_head_dir_2d.squeeze(0)], dim=-1).unsqueeze(0)
 
         # Lidar States
         lidar_scan = torch.tensor(self.raypoints, device=self.cfg.device)
         lidar_scan = (lidar_scan - pos).norm(dim=-1).clamp_max(self.cfg.sensor.lidar_range).reshape(1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams)
-        lidar_scan = self.cfg.sensor.lidar_range - lidar_scan
+        
+        lidar_scan = lidar_scan - lidar_scan
+        # print("lidar ",lidar_scan)
 
+        # lidar_scan = torch.zeros(self.raypoints, device=self.cfg.device)
 
         # dynamic obstacle states
         dynamic_obstacle_pos = self.dynamic_obstacles[0].clone()
@@ -416,6 +455,9 @@ class Navigation:
         #                             closest_dyn_obs_width.unsqueeze(1), closest_dyn_obs_height.unsqueeze(1)], dim=-1).unsqueeze(0).unsqueeze(0)
         dyn_obs_states = torch.cat([closest_dyn_obs_rpos_gn, closest_dyn_obs_distance_2d, closest_dyn_obs_distance_z, closest_dyn_obs_vel_g, \
                                     closest_dyn_obs_width.unsqueeze(1), closest_dyn_obs_height.unsqueeze(1)], dim=-1).unsqueeze(0).unsqueeze(0)
+        
+        # print("drone_state",drone_state)
+        # print("lidar",lidar_scan)
         # states
         obs = TensorDict({
             "agents": TensorDict({
@@ -423,36 +465,17 @@ class Navigation:
                     "state": drone_state,
                     "lidar": lidar_scan,
                     "direction": target_dir_2d,
-                    "current_head_dir": current_head_dir_2d,
+                    "current_head_dir_2d": current_head_dir_2d,
                 })
             })
         })
 
         has_obstacle_in_range = self.check_obstacle(lidar_scan, dyn_obs_states)
-        # if (False):
-        if (has_obstacle_in_range):
-            if (not self.use_policy_server):
-                with set_exploration_type(ExplorationType.MEAN):
-                    output = self.policy(obs)
-                vel_world = output["agents", "action"]
-            else:
-                try:
-                    get_policy_inference = rospy.ServiceProxy("rl_navigation/GetPolicyInference", GetPolicyInference)
+        
+        with set_exploration_type(ExplorationType.MEAN):
+            output = self.policy(obs)
+        vel_world = output["agents", "action"]
 
-                    response = get_policy_inference(obs["agents"]["observation"]["state"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["state"].size(),
-                                                    obs["agents"]["observation"]["lidar"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["lidar"].size(), 
-                                                    obs["agents"]["observation"]["direction"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["direction"].size(),
-                                                    obs["agents"]["observation"]["current_head_dir"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["current_head_dir"].size())
-                    vel_world = torch.tensor(response.action, device=self.cfg.device, dtype=torch.float).unsqueeze(0).unsqueeze(0)
-                except rospy.service.ServiceException as e:
-                    print("[nav-ros]: Policy server err!")
-                    vel_world = torch.tensor([0., 0., 0.], device=self.cfg.device).unsqueeze(0).unsqueeze(0)
-        else:
-            vel_world =  (goal - pos)/torch.norm(goal - pos) * self.cfg.algo.actor.action_limit
         return vel_world
 
 
@@ -483,23 +506,23 @@ class Navigation:
         # check for angle
         goal_angle = np.arctan2(self.target_dir[1].cpu().numpy(), self.target_dir[0].cpu().numpy())
         _, _, curr_angle = tf.transformations.euler_from_quaternion([self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z, self.odom.pose.pose.orientation.w])
-        angle_diff = np.abs(goal_angle - curr_angle)
-        if (angle_diff > math.pi):
-            angle_diff = np.abs(angle_diff - math.pi * 2)
-        if (angle_diff >= 0.1):
-            pose_msg = PoseStamped()
-            pose_msg.pose = self.odom.pose.pose
-            quaternion = tf.transformations.quaternion_from_euler(0, 0, goal_angle)
-            pose_msg.pose.orientation.w = quaternion[3]
-            pose_msg.pose.orientation.x = quaternion[0]
-            pose_msg.pose.orientation.y = quaternion[1]
-            pose_msg.pose.orientation.z = quaternion[2]
-            self.pose_pub.publish(pose_msg)
-            return
-        else:
-            self.stable_times += 1
-            if (self.stable_times <= 10):
-                return
+        # angle_diff = np.abs(goal_angle - curr_angle)
+        # if (angle_diff > math.pi):
+        #     angle_diff = np.abs(angle_diff - math.pi * 2)
+        # if (angle_diff >= 0.1):
+        #     pose_msg = PoseStamped()
+        #     pose_msg.pose = self.odom.pose.pose
+        #     quaternion = tf.transformations.quaternion_from_euler(0, 0, goal_angle)
+        #     pose_msg.pose.orientation.w = quaternion[3]
+        #     pose_msg.pose.orientation.x = quaternion[0]
+        #     pose_msg.pose.orientation.y = quaternion[1]
+        #     pose_msg.pose.orientation.z = quaternion[2]
+        #     self.pose_pub.publish(pose_msg)
+        #     return
+        # else:
+        #     self.stable_times += 1
+        #     if (self.stable_times <= 10):
+        #         return
 
         pos = torch.tensor([self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z], device=self.cfg.device)
         goal = torch.tensor([self.goal.pose.position.x, self.goal.pose.position.y, self.goal.pose.position.z], device=self.cfg.device)
@@ -508,25 +531,19 @@ class Navigation:
         vel_body = np.array([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z])
         vel_world = torch.tensor(rot @ vel_body, device=self.cfg.device, dtype=torch.float) # world vel
         
-        ori = torch.tensor([self.odom.pose.pose.orientation.w, self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z], device=self.cfg.device)
-
         # get RL action from model
-        cmd_vel_world = self.get_action(pos, vel_world, ori).squeeze(0).squeeze(0).detach().cpu().numpy()        
+        cmd_vel_world = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
         self.cmd_vel_world = cmd_vel_world.copy()
+        # print("cmd:",cmd_vel_world)
 
         # get safe action
-        safe_cmd_vel_world = self.get_safe_action(vel_world, cmd_vel_world)
+        safe_cmd_vel_world = cmd_vel_world[:3]
+        # safe_cmd_vel_world = self.get_safe_action(vel_world, cmd_vel_world)
         # safe_cmd_vel_world = self.get_safe_action_map(vel_world, cmd_vel_world)
         # safe_cmd_vel_world[2] = 0
         self.safe_cmd_vel_world = safe_cmd_vel_world.copy()
-        quat_no_tilt = tf.transformations.quaternion_from_euler(0, 0, curr_angle)
-        quat_msg = Quaternion()
-        quat_msg.w = quat_no_tilt[3]
-        quat_msg.x = quat_no_tilt[0]
-        quat_msg.y = quat_no_tilt[1]
-        quat_msg.z = quat_no_tilt[2]
-        rot_no_tilt = self.quaternion_to_rotation_matrix(quat_msg)
-        safe_cmd_vel_local = np.linalg.inv(rot_no_tilt) @ safe_cmd_vel_world
+
+        safe_cmd_vel_local = safe_cmd_vel_world
 
         # Goal condition
         distance = (pos - goal).norm() 
@@ -561,8 +578,9 @@ class Navigation:
         else:
             final_cmd_vel = TwistStamped()
             final_cmd_vel.header.stamp = rospy.Time.now()
-            final_cmd_vel.twist.linear.x = safe_cmd_vel_local[0]
-            final_cmd_vel.twist.linear.y = safe_cmd_vel_local[1]
+            final_cmd_vel.twist.linear.x = 0
+            final_cmd_vel.twist.linear.y = 0
+            final_cmd_vel.twist.angular.z = cmd_vel_world[3]
             if (self.height_control):
                 final_cmd_vel.twist.linear.z = safe_cmd_vel_world[2]
             else:

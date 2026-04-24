@@ -409,6 +409,8 @@ class NavigationEnv(IsaacEnv):
  
         reward_head = b_t * w_t * g_t 
 
+        # 距离目标点距离小于0.5，并且yaw偏角小于30度，就认为达到目标点并且朝向正确，给予较大的reward
+
         reward_reach = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         reward_reach[distance.squeeze(-1) < 0.5] = 1.0
 
@@ -422,6 +424,9 @@ class NavigationEnv(IsaacEnv):
         # reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
         # print("reward_yaw", reward_yaw)
         penalty_acc = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1) 
+
+        vel_body = vec_to_new_frame(self.drone.vel_w[..., :3], head_dir_2d)
+        penalty_acc_body = (vel_body - vec_to_new_frame(self.prev_drone_vel_w, head_dir_2d)).norm(dim=-1)
 
         # print("penalty_smooth", penalty_smooth)
         # e. height penalty reward for flying unnessarily high or low
@@ -440,7 +445,7 @@ class NavigationEnv(IsaacEnv):
         
         init_distance = self.target_dir.norm(dim=-1, keepdim=True)# initial distance from start to goal, used for distance reward calculation
         # 
-        reward_distance = ((distance.squeeze(-1) / init_distance.squeeze(-1)).clamp_min(1e-6))
+        reward_distance = -((distance.squeeze(-1) / init_distance.squeeze(-1)).clamp_min(1e-6))
         # print("reward_distance", reward_distance)
 
         self.reward = reward_distance*1.0 + reward_safety_static*(1.0) + reward_pos*(10.0) + reward_head*(5.0) + reward_reach*(100.0) + reward_vel*(1.0) + penalty_collision*(-100.0)+ penalty_height*(-5.0)

@@ -15,7 +15,7 @@ class PPO(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        
+        self.first_done = 0
         # Feature extractor for LiDAR
         feature_extractor_network = nn.Sequential(
             nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
@@ -81,13 +81,16 @@ class PPO(TensorDictModuleBase):
 
         # Cooridnate change: transform local to world
         actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
-        print("actions: ", actions)
+        # print("actions: ", actions)
         # print("actions shape: ", actions.shape)
 
-        
         actions_xyz = torch.zeros((*actions.shape[:-1], 3), device=actions.device)
         actions_xyz[..., [0, 2]] = actions[..., [0, 1]] # map the first two dimension of action to x and z velocity
         # print("actions xyz: ", actions_xyz)
+
+        # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
+        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
+        # print("actions world: ", actions_world)
 
         actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)
         actions_target[..., :3] = actions_xyz
@@ -95,5 +98,4 @@ class PPO(TensorDictModuleBase):
         # print("actions target: ", actions_target)
 
         tensordict["agents", "action"] = actions_target
-
         return tensordict

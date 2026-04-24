@@ -112,14 +112,13 @@ class Navigation:
         self.takeoff()
   
     def init_model(self):
-        observation_dim = 11
+        observation_dim = 6
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.cfg.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device),
-                    "direction": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
                     "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
                 }),
             }).expand(1)
@@ -136,7 +135,7 @@ class Navigation:
 
         checkpoint = get_latest_checkpoint()
 
-        policy.load_state_dict(torch.load(checkpoint, map_location=self.cfg.device))
+        policy.load_state_dict(torch.load("/home/shuimujieming/NavRL/isaac-training/wandb/run-20260424_092520-wolzrv55/files/checkpoint_6000.pt", map_location=self.cfg.device))
         return policy
 
     def takeoff(self):
@@ -389,16 +388,9 @@ class Navigation:
             # print("[nav-ros]: no safety running!")
             return action_vel_world   
     
-    def get_action(self, pos: torch.Tensor, vel: torch.Tensor, goal: torch.Tensor): # use world velocity
+    def get_action(self, pos: torch.Tensor, vel_w: torch.Tensor, goal: torch.Tensor): # use world velocity
+        
         rpos = goal - pos
-
-        orientation = torch.tensor([ self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z,self.odom.pose.pose.orientation.w], device=self.cfg.device)
-
-        # current robot heading direction in the horizontal plane
-        current_head_dir_2d = quat_axis(orientation.unsqueeze(0), axis=0)
-        current_head_dir_2d[..., 2] = 0
-        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-
         distance = rpos.norm(dim=-1, keepdim=True)
         distance_2d = rpos[..., :2].norm(dim=-1, keepdim=True)
         distance_z = rpos[..., 2].unsqueeze(-1)
@@ -411,71 +403,67 @@ class Navigation:
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d).squeeze(0).squeeze(0)
 
         # "relative" velocity
-        vel_w = vel
         vel_g = vec_to_new_frame(vel_w, target_dir_2d).squeeze(0).squeeze(0) # goal velocity
 
+        orientation = torch.tensor([self.odom.pose.pose.orientation.w, self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z], device=self.cfg.device).unsqueeze(0)
+        
+        # current robot heading direction in the horizontal plane
+        current_head_dir_2d = quat_axis(orientation, axis=0)
+        
+        head_dir_2d = current_head_dir_2d.clone()
+        head_dir_2d[..., 2] = 0
+
+        current_head_dir_2d[..., 2] = 0
+        current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        rpos_head = vec_to_new_frame(rpos, head_dir_2d).squeeze(0).squeeze(0) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
+        vel_head = vec_to_new_frame(vel_w, head_dir_2d).squeeze(0).squeeze(0)
+
+
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g, current_head_dir_2d.squeeze(0)], dim=-1).unsqueeze(0)
+        drone_state = torch.cat([rpos_head, vel_head], dim=-1).unsqueeze(0)
 
         # Lidar States
+        # if(self.raypoints is None or len(self.raypoints) == 0):
+        #     lidar_scan = torch.ones((1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device) * self.cfg.sensor.lidar_range
+        # else:
+
         lidar_scan = torch.tensor(self.raypoints, device=self.cfg.device)
         lidar_scan = (lidar_scan - pos).norm(dim=-1).clamp_max(self.cfg.sensor.lidar_range).reshape(1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams)
-        
         lidar_scan = lidar_scan - lidar_scan
-        # print("lidar ",lidar_scan)
 
-        # lidar_scan = torch.zeros(self.raypoints, device=self.cfg.device)
+        print("lidar_scan shape before processing: ", lidar_scan)
 
-        # dynamic obstacle states
-        dynamic_obstacle_pos = self.dynamic_obstacles[0].clone()
-        dynamic_obstacle_vel = self.dynamic_obstacles[1].clone()
-        dynamic_obstacle_size = self.dynamic_obstacles[2].clone()
-        closest_dyn_obs_rpos = dynamic_obstacle_pos - pos
-        closest_dyn_obs_rpos[dynamic_obstacle_size[:, 2] == 0] = 0.
-        closest_dyn_obs_rpos[:, 2][dynamic_obstacle_size[:, 2] > 1] = 0.
-        closest_dyn_obs_rpos_g = vec_to_new_frame(closest_dyn_obs_rpos.unsqueeze(0), target_dir_2d).squeeze(0)
-        closest_dyn_obs_distance = closest_dyn_obs_rpos.norm(dim=-1, keepdim=True)
-        closest_dyn_obs_distance_2d = closest_dyn_obs_rpos_g[..., :2].norm(dim=-1, keepdim=True)
-        closest_dyn_obs_distance_z = closest_dyn_obs_rpos_g[..., 2].unsqueeze(-1)
-        closest_dyn_obs_rpos_gn = closest_dyn_obs_rpos_g / closest_dyn_obs_distance.clamp(1e-6)
+        # lidar_scan = self.cfg.sensor.lidar_range - (
+        #     (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
+        #     .norm(dim=-1)
+        #     .clamp_max(self.cfg.sensor.lidar_range)
+        #     .reshape(1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams)
+        # )
 
+        # print("drone_state: ", drone_state)
+        # print("target_dir_2d: ", target_dir_2d)
+        # print("current_head_dir_2d: ", current_head_dir_2d)
 
-
-        closest_dyn_obs_vel_g = vec_to_new_frame(dynamic_obstacle_vel.unsqueeze(0), target_dir_2d).squeeze(0)
+        # print("lidar_scan", lidar_scan)
         
-        obs_res = 0.25
-        closest_dyn_obs_width = torch.max(dynamic_obstacle_size[:, 0], dynamic_obstacle_size[:, 1])
-        closest_dyn_obs_width += self.robot_size * 2.
-        closest_dyn_obs_width = torch.clamp(torch.ceil(closest_dyn_obs_width / 0.25) - 1, min=0, max=1./obs_res - 1)
-        closest_dyn_obs_width[dynamic_obstacle_size[:, 2] == 0] = 0.
-        closest_dyn_obs_height = dynamic_obstacle_size[:, 2]
-        closest_dyn_obs_height[(closest_dyn_obs_height <= 1) & (closest_dyn_obs_height != 0)] = 1.
-        closest_dyn_obs_height[closest_dyn_obs_height > 1] = 0.
-        # dyn_obs_states = torch.cat([closest_dyn_obs_rpos_g, closest_dyn_obs_vel_g, \
-        #                             closest_dyn_obs_width.unsqueeze(1), closest_dyn_obs_height.unsqueeze(1)], dim=-1).unsqueeze(0).unsqueeze(0)
-        dyn_obs_states = torch.cat([closest_dyn_obs_rpos_gn, closest_dyn_obs_distance_2d, closest_dyn_obs_distance_z, closest_dyn_obs_vel_g, \
-                                    closest_dyn_obs_width.unsqueeze(1), closest_dyn_obs_height.unsqueeze(1)], dim=-1).unsqueeze(0).unsqueeze(0)
-        
-        # print("drone_state",drone_state)
-        # print("lidar",lidar_scan)
         # states
         obs = TensorDict({
             "agents": TensorDict({
                 "observation": TensorDict({
                     "state": drone_state,
                     "lidar": lidar_scan,
-                    "direction": target_dir_2d,
                     "current_head_dir_2d": current_head_dir_2d,
                 })
             })
         })
 
-        has_obstacle_in_range = self.check_obstacle(lidar_scan, dyn_obs_states)
-        
-        with set_exploration_type(ExplorationType.MEAN):
-            output = self.policy(obs)
-        vel_world = output["agents", "action"]
-
+        # if (False):
+        if (not self.use_policy_server):
+            with set_exploration_type(ExplorationType.MEAN):
+                output = self.policy(obs)
+            vel_world = output["agents", "action"]
+ 
         return vel_world
 
 
@@ -502,104 +490,38 @@ class Navigation:
             self.pose_pub.publish(self.stop_pose)
             return
         
-        start_time = time.time()
-        # check for angle
-        goal_angle = np.arctan2(self.target_dir[1].cpu().numpy(), self.target_dir[0].cpu().numpy())
-        _, _, curr_angle = tf.transformations.euler_from_quaternion([self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z, self.odom.pose.pose.orientation.w])
-        # angle_diff = np.abs(goal_angle - curr_angle)
-        # if (angle_diff > math.pi):
-        #     angle_diff = np.abs(angle_diff - math.pi * 2)
-        # if (angle_diff >= 0.1):
-        #     pose_msg = PoseStamped()
-        #     pose_msg.pose = self.odom.pose.pose
-        #     quaternion = tf.transformations.quaternion_from_euler(0, 0, goal_angle)
-        #     pose_msg.pose.orientation.w = quaternion[3]
-        #     pose_msg.pose.orientation.x = quaternion[0]
-        #     pose_msg.pose.orientation.y = quaternion[1]
-        #     pose_msg.pose.orientation.z = quaternion[2]
-        #     self.pose_pub.publish(pose_msg)
-        #     return
-        # else:
-        #     self.stable_times += 1
-        #     if (self.stable_times <= 10):
-        #         return
-
         pos = torch.tensor([self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z], device=self.cfg.device)
         goal = torch.tensor([self.goal.pose.position.x, self.goal.pose.position.y, self.goal.pose.position.z], device=self.cfg.device)
-        orientation = torch.tensor([self.odom.pose.pose.orientation.w, self.odom.pose.pose.orientation.x, self.odom.pose.pose.orientation.y, self.odom.pose.pose.orientation.z], device=self.cfg.device)
+
         rot = self.quaternion_to_rotation_matrix(self.odom.pose.pose.orientation)
         vel_body = np.array([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z])
         vel_world = torch.tensor(rot @ vel_body, device=self.cfg.device, dtype=torch.float) # world vel
         
         # get RL action from model
-        cmd_vel_world = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
-        self.cmd_vel_world = cmd_vel_world.copy()
-        # print("cmd:",cmd_vel_world)
-
-        # get safe action
-        safe_cmd_vel_world = cmd_vel_world[:3]
-        # safe_cmd_vel_world = self.get_safe_action(vel_world, cmd_vel_world)
-        # safe_cmd_vel_world = self.get_safe_action_map(vel_world, cmd_vel_world)
-        # safe_cmd_vel_world[2] = 0
-        self.safe_cmd_vel_world = safe_cmd_vel_world.copy()
-
-        safe_cmd_vel_local = safe_cmd_vel_world
+        cmd_vel_local = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
 
         # Goal condition
         distance = (pos - goal).norm() 
-        if (distance <= 3. and distance > 0.3):
-            if (np.linalg.norm(safe_cmd_vel_local) != 0):
-                safe_cmd_vel_local = 0.5 * safe_cmd_vel_local/np.linalg.norm(safe_cmd_vel_local)
-                safe_cmd_vel_world = 0.5 * safe_cmd_vel_world/np.linalg.norm(safe_cmd_vel_world)
-        elif (distance <= 1.0):
-            safe_cmd_vel_local *= 0.
-            safe_cmd_vel_world *= 0.
+        # if (distance <= 3. and distance > 0.3):
+        #     if (np.linalg.norm(cmd_vel_local) != 0):
+        #         cmd_vel_local = 0.5 * cmd_vel_local/np.linalg.norm(cmd_vel_local)
+        if (distance <= 0.5):
+            cmd_vel_local *= 0.
+            print("[nav-ros]: Goal reached! distance: ", distance.item())
 
-        # final action
-        if (self.px4_control):
-            final_cmd_vel = PositionTarget()
-            final_cmd_vel.coordinate_frame = final_cmd_vel.FRAME_LOCAL_NED
-            final_cmd_vel.header.stamp = rospy.Time.now()
-            final_cmd_vel.header.frame_id = "map"
-            if (self.height_control):
-                final_cmd_vel.velocity.x = safe_cmd_vel_world[0]
-                final_cmd_vel.velocity.y = safe_cmd_vel_world[1]
-                final_cmd_vel.velocity.z = safe_cmd_vel_world[2]
-                final_cmd_vel.yaw = goal_angle
-                final_cmd_vel.type_mask = final_cmd_vel.IGNORE_PX + final_cmd_vel.IGNORE_PY + final_cmd_vel.IGNORE_PZ + \
-                    final_cmd_vel.IGNORE_AFX + final_cmd_vel.IGNORE_AFY + final_cmd_vel.IGNORE_AFZ + final_cmd_vel.IGNORE_YAW_RATE
-            else:
-                final_cmd_vel.velocity.x = safe_cmd_vel_world[0]
-                final_cmd_vel.velocity.y = safe_cmd_vel_world[1]
-                final_cmd_vel.position.z = self.takeoff_pose.pose.position.z
-                final_cmd_vel.yaw = goal_angle
-                final_cmd_vel.type_mask = final_cmd_vel.IGNORE_PX + final_cmd_vel.IGNORE_PY + final_cmd_vel.IGNORE_VZ + \
-                    final_cmd_vel.IGNORE_AFX + final_cmd_vel.IGNORE_AFY + final_cmd_vel.IGNORE_AFZ + final_cmd_vel.IGNORE_YAW_RATE                           
+        final_cmd_vel = TwistStamped()
+        final_cmd_vel.header.stamp = rospy.Time.now()
+        final_cmd_vel.twist.linear.x = cmd_vel_local[0]
+        final_cmd_vel.twist.linear.y = cmd_vel_local[1]
+        final_cmd_vel.twist.angular.z = cmd_vel_local[3]
+        if (self.height_control):
+            final_cmd_vel.twist.linear.z = cmd_vel_local[2]
         else:
-            final_cmd_vel = TwistStamped()
-            final_cmd_vel.header.stamp = rospy.Time.now()
-            final_cmd_vel.twist.linear.x = 0
-            final_cmd_vel.twist.linear.y = 0
-            final_cmd_vel.twist.angular.z = cmd_vel_world[3]
-            if (self.height_control):
-                final_cmd_vel.twist.linear.z = safe_cmd_vel_world[2]
-            else:
-                final_cmd_vel.twist.linear.z = 0
-        self.action_pub.publish(final_cmd_vel)
-        self.has_action = True
+            final_cmd_vel.twist.linear.z = 0
 
-        # rollout_traj = self.get_rollout_traj(pos, vel_world, goal, dt=0.1, horizon=3.0)
-        # traj_msg = Path()
-        # traj_msg.header.frame_id = "map"
-        # for i in range(len(rollout_traj)):
-        #     p = PoseStamped()
-        #     p.pose.position.x = rollout_traj[i][0]
-        #     p.pose.position.y = rollout_traj[i][1]
-        #     p.pose.position.z = rollout_traj[i][2]
-        #     traj_msg.poses.append(p)
-        # self.rollout_traj_pub.publish(traj_msg)
-        end_time = time.time()
-        # print("[nav-ros]: control time ", end_time - start_time)
+        print("cmd_vel",cmd_vel_local)
+        self.action_pub.publish(final_cmd_vel)
+        # self.has_action = True
         
     def pause_sim():
         rospy.wait_for_service('/gazebo/pause_physics')

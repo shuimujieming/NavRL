@@ -60,8 +60,8 @@ def main(cfg):
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
 
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
-    # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
-    # policy.load_state_dict(torch.load(checkpoint))
+    checkpoint = "/home/shuimujieming/NavRL/isaac-training/wandb/run-20260424_013755-xtk1p31t/files/checkpoint_36000.pt"
+    policy.load_state_dict(torch.load(checkpoint))
     
     # Episode Stats Collector
     episode_stats_keys = [

@@ -147,14 +147,13 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        observation_dim = 11
+        observation_dim = 6 # rpos(3), vel_w(3), ang_w(3), current_head_dir_2d(3)
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
-                    "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                     "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                 }),
             }).expand(self.num_envs)
@@ -338,6 +337,9 @@ class NavigationEnv(IsaacEnv):
 
         # current robot heading direction in the horizontal plane
         current_head_dir_2d = quat_axis(self.root_state[..., 3:7], axis=0)
+        head_dir_2d = current_head_dir_2d.clone()
+        head_dir_2d[..., 2] = 0
+
         current_head_dir_2d[..., 2] = 0
         current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -351,15 +353,20 @@ class NavigationEnv(IsaacEnv):
         # vel_w[...,2] = 0. # only care about horizontal velocity for the input, we will add vertical velocity as a separate input
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
+        ang_w = self.root_state[..., 10:13] # world angular velocity
+        
+        quat = self.root_state[..., 3:7]
+
+        rpos_head = vec_to_new_frame(rpos, head_dir_2d) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
+        vel_head = vec_to_new_frame(vel_w, head_dir_2d)
         # final drone's internal states
         # drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
+        drone_state = torch.cat([rpos_head, vel_head], dim=-1).squeeze(1)
 
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
             "lidar": self.lidar_scan,
-            "direction": target_dir_2d,
             "current_head_dir_2d": current_head_dir_2d,
         }
 
@@ -411,14 +418,11 @@ class NavigationEnv(IsaacEnv):
         penalty_vel = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_vel[self.drone.vel_b[..., 0] > 2.0] = (self.drone.vel_b[..., 0] - 2.0)[self.drone.vel_b[..., 0] > 2.0]
         penalty_vel[self.drone.vel_b[..., 0] < 0.2] = (0.2 - self.drone.vel_b[..., 0])[self.drone.vel_b[..., 0] < 0.2]
-        penalty_vel = 0.0 * penalty_vel 
+
         # reward_yaw = (current_head_dir_2d * vel_direction).sum(-1)#.clip(max=2.0)
         # print("reward_yaw", reward_yaw)
         penalty_acc = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1) 
 
-        # print("reward_goal", reward_goal)
-        # d. smoothness reward for action smoothness
-        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
         # print("penalty_smooth", penalty_smooth)
         # e. height penalty reward for flying unnessarily high or low
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
@@ -434,11 +438,13 @@ class NavigationEnv(IsaacEnv):
         penalty_collision = static_collision
         # print("reward_collision", reward_collision)
         
-        self.reward = reward_safety_static *(1.0) + reward_pos*(10.0) + reward_head*(5.0) + reward_reach *(100.0) + reward_vel + penalty_collision *(-100.0)+ penalty_height* (-5.0)
-        
-        # self.reward = reward_vel + 1. + reward_safety_static*2.0 - penalty_smooth * 1.0 - penalty_height * 8.0 + reward_yaw*8.0 + reward_goal*8.0
-        # self.reward = reward_vel + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+        init_distance = self.target_dir.norm(dim=-1, keepdim=True)# initial distance from start to goal, used for distance reward calculation
+        # 
+        reward_distance = ((distance.squeeze(-1) / init_distance.squeeze(-1)).clamp_min(1e-6))
+        # print("reward_distance", reward_distance)
 
+        self.reward = reward_distance*1.0 + reward_safety_static*(1.0) + reward_pos*(10.0) + reward_head*(5.0) + reward_reach*(100.0) + reward_vel*(1.0) + penalty_collision*(-100.0)+ penalty_height*(-5.0)
+        
         self.last_distance = distance
 
         # Terminal reward

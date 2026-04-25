@@ -31,13 +31,13 @@ pip uninstall -y tensordict
 pip uninstall -y tensordict
 pip install tomli  # If missing 'tomli'
 cd ./third_party/tensordict
-python setup.py develop
+python setup.py develop --no-deps
 
 
 # Step 3: Install TorchRL
 echo "Installing TorchRL..."
 cd ../rl
-python setup.py develop
+python setup.py develop --no-deps
 
 # Check which torch is being used
 python -c "import torch; print(torch.__path__)"

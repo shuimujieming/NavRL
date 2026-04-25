@@ -77,13 +77,13 @@ pip uninstall -y tensordict
 pip uninstall -y tensordict
 pip install tomli  # If missing 'tomli'
 cd ../tensordict
-python setup.py develop
+python setup.py develop --no-deps
 
 
 # Step 6: Install TorchRL
 echo "Installing TorchRL..."
 cd ../rl
-python setup.py develop
+python setup.py develop --no-deps
 
 #修复安装后的torch版本问题，以及libxcb版本问题，确保与OmniIsaac Kit兼容。
 pip install torch==2.0.1
@@ -93,4 +93,3 @@ conda install libxcb==1.15
 python -c "import torch; print(torch.__path__)"
 
 echo "Setup completed successfully!"
-

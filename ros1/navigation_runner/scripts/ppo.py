@@ -89,7 +89,7 @@ class PPO(TensorDictModuleBase):
         # print("actions xyz: ", actions_xyz)
 
         # current_yaw = quaternion_to_euler(quat)[..., 2].unsqueeze(-1).unsqueeze(1)
-        actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
+        # actions_world = vec_to_world(actions_xyz, tensordict["agents", "observation", "current_head_dir_2d"])
         # print("actions world: ", actions_world)
 
         actions_target = torch.zeros((*actions.shape[:-1], 1, 4), device=actions.device)

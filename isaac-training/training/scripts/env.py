@@ -36,8 +36,6 @@ class NavigationEnv(IsaacEnv):
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
-        self.first_distance_flag = False
-        self.last_distance = 0.0
         super().__init__(cfg, cfg.headless)
         
         # Drone Initialization
@@ -77,6 +75,8 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            self.last_distance = torch.zeros(self.num_envs, 1, 1)
+            self.last_yaw = torch.zeros(self.num_envs, 1)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -147,14 +147,13 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        observation_dim = 6 # rpos(3), vel_w(3), ang_w(3), current_head_dir_2d(3)
+        observation_dim = 9 # rpos(3), vel_w(3), ang_w(3), current_head_dir_2d(3)
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
-                    "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                 }),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -199,6 +198,7 @@ class NavigationEnv(IsaacEnv):
 
         info_spec = CompositeSpec({
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
+            "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.observation_spec["info"] = info_spec
@@ -276,6 +276,8 @@ class NavigationEnv(IsaacEnv):
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        self.last_distance[env_ids] = self.target_dir[env_ids].norm(dim=-1, keepdim=True)
+        self.last_yaw[env_ids] = rpy[..., 2]
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
@@ -327,10 +329,6 @@ class NavigationEnv(IsaacEnv):
         distance_2d = rpos[..., :2].norm(dim=-1, keepdim=True)
         distance_z = rpos[..., 2].unsqueeze(-1)
         
-        if self.first_distance_flag == False:
-            self.last_distance = distance
-            self.first_distance_flag = True
-        
         # b. unit direction vector to goal
         target_dir_2d = self.target_dir.clone()
         target_dir_2d[..., 2] = 0
@@ -342,7 +340,7 @@ class NavigationEnv(IsaacEnv):
 
         current_head_dir_2d[..., 2] = 0
         current_head_dir_2d = current_head_dir_2d / current_head_dir_2d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-
+        self.info["current_head_dir_2d"][:] = current_head_dir_2d
         rpos_clipped = rpos / distance.clamp(1e-6) # unit vector: start to goal direction
         # rpos_clipped[...,2] = 0. # only care about the horizontal direction for the input, we will add vertical distance as a separate input
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
@@ -354,20 +352,21 @@ class NavigationEnv(IsaacEnv):
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
         ang_w = self.root_state[..., 10:13] # world angular velocity
+        ang_head = vec_to_new_frame(ang_w, head_dir_2d) # coordinate change for angular velocity in the heading frame, where the x axis is the current heading direction
         
         quat = self.root_state[..., 3:7]
 
         rpos_head = vec_to_new_frame(rpos, head_dir_2d) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
         vel_head = vec_to_new_frame(vel_w, head_dir_2d)
+
         # final drone's internal states
         # drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_head, vel_head], dim=-1).squeeze(1)
+        drone_state = torch.cat([rpos_head, vel_head ,ang_head], dim=-1).squeeze(1)
 
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
             "lidar": self.lidar_scan,
-            "current_head_dir_2d": current_head_dir_2d,
         }
 
         # -----------------Reward Calculation-----------------
@@ -381,6 +380,7 @@ class NavigationEnv(IsaacEnv):
 
         # b. safety reward for dynamic obstacles
         reward_pos = (self.last_distance - distance).squeeze(-1)
+
 
         # yaw reward for facing the goal direction
         quat = self.root_state[..., 3:7]
@@ -409,10 +409,13 @@ class NavigationEnv(IsaacEnv):
  
         reward_head = b_t * w_t * g_t 
 
+        penalty_diffyaw = (self.last_yaw - current_yaw).abs()
+        # print("penalty_diffyaw", penalty_diffyaw.shape)
+
         # 距离目标点距离小于0.5，并且yaw偏角小于30度，就认为达到目标点并且朝向正确，给予较大的reward
 
         reward_reach = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        reward_reach[distance.squeeze(-1) < 0.5] = 1.0
+        reward_reach[(distance.squeeze(-1) < 0.5) & (torch.abs(diff_yaw) < np.pi / 6)] = 1.0
 
         vel_direction = rpos / distance.clamp_min(1e-6)
         reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)#.clip(max=2.0) 
@@ -448,10 +451,9 @@ class NavigationEnv(IsaacEnv):
         reward_distance = -((distance.squeeze(-1) / init_distance.squeeze(-1)).clamp_min(1e-6))
         # print("reward_distance", reward_distance)
 
-        self.reward = reward_distance*1.0 + reward_safety_static*(1.0) + reward_pos*(10.0) + reward_head*(5.0) + reward_reach*(100.0) + reward_vel*(1.0) + penalty_collision*(-100.0)+ penalty_height*(-5.0)
-        
+        self.reward = reward_distance*1.0 + reward_safety_static*(1.0) + reward_pos*(20.0) + reward_head*(5.0) + reward_reach*(100.0) + reward_vel*(1.0) + penalty_collision*(-100.0)+ penalty_height*(-5.0)        
         self.last_distance = distance
-
+        self.last_yaw = current_yaw
         # Terminal reward
         # self.reward[collision] -= 50. # collision
 

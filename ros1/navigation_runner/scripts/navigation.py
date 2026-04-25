@@ -112,7 +112,7 @@ class Navigation:
         self.takeoff()
   
     def init_model(self):
-        observation_dim = 6
+        observation_dim = 9
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -135,7 +135,7 @@ class Navigation:
 
         checkpoint = get_latest_checkpoint()
 
-        policy.load_state_dict(torch.load("/home/shuimujieming/NavRL/isaac-training/wandb/run-20260424_092520-wolzrv55/files/checkpoint_6000.pt", map_location=self.cfg.device))
+        policy.load_state_dict(torch.load(checkpoint, map_location=self.cfg.device))
         return policy
 
     def takeoff(self):
@@ -388,7 +388,7 @@ class Navigation:
             # print("[nav-ros]: no safety running!")
             return action_vel_world   
     
-    def get_action(self, pos: torch.Tensor, vel_w: torch.Tensor, goal: torch.Tensor): # use world velocity
+    def get_action(self, pos: torch.Tensor, vel_w: torch.Tensor, ang_w: torch.Tensor, goal: torch.Tensor): # use world velocity
         
         rpos = goal - pos
         distance = rpos.norm(dim=-1, keepdim=True)
@@ -419,9 +419,8 @@ class Navigation:
         rpos_head = vec_to_new_frame(rpos, head_dir_2d).squeeze(0).squeeze(0) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
         vel_head = vec_to_new_frame(vel_w, head_dir_2d).squeeze(0).squeeze(0)
 
-
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_head, vel_head], dim=-1).unsqueeze(0)
+        drone_state = torch.cat([rpos_head, vel_head, ang_w], dim=-1).unsqueeze(0)
 
         # Lidar States
         # if(self.raypoints is None or len(self.raypoints) == 0):
@@ -430,7 +429,7 @@ class Navigation:
 
         lidar_scan = torch.tensor(self.raypoints, device=self.cfg.device)
         lidar_scan = (lidar_scan - pos).norm(dim=-1).clamp_max(self.cfg.sensor.lidar_range).reshape(1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams)
-        lidar_scan = lidar_scan - lidar_scan
+        lidar_scan = self.cfg.sensor.lidar_range - lidar_scan
 
         print("lidar_scan shape before processing: ", lidar_scan)
 
@@ -453,7 +452,6 @@ class Navigation:
                 "observation": TensorDict({
                     "state": drone_state,
                     "lidar": lidar_scan,
-                    "current_head_dir_2d": current_head_dir_2d,
                 })
             })
         })
@@ -497,8 +495,9 @@ class Navigation:
         vel_body = np.array([self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z])
         vel_world = torch.tensor(rot @ vel_body, device=self.cfg.device, dtype=torch.float) # world vel
         
+        ang_body = torch.tensor([self.odom.twist.twist.angular.x, self.odom.twist.twist.angular.y, self.odom.twist.twist.angular.z], device=self.cfg.device, dtype=torch.float)
         # get RL action from model
-        cmd_vel_local = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
+        cmd_vel_local = self.get_action(pos, vel_world, ang_body, goal).squeeze(0).squeeze(0).detach().cpu().numpy()        
 
         # Goal condition
         distance = (pos - goal).norm() 

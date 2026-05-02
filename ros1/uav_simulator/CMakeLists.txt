@@ -152,6 +152,13 @@ add_library(quadcopterPlugin SHARED
 
 add_library(obstaclePathPlugin src/obstaclePathPlugin.cc)
 
+# Boost versions shipped with some ROS/Gazebo distributions use
+# `#if PTHREAD_STACK_MIN > 0`, while newer glibc may define
+# PTHREAD_STACK_MIN as a runtime sysconf() expression. Pin it to the
+# Linux constant for these plugins so Boost's preprocessor check remains valid.
+target_compile_definitions(quadcopterPlugin PRIVATE PTHREAD_STACK_MIN=16384)
+target_compile_definitions(obstaclePathPlugin PRIVATE PTHREAD_STACK_MIN=16384)
+
 ## Add cmake target dependencies of the library
 ## as an example, code may need to be generated before libraries
 ## either from message generation or dynamic reconfigure

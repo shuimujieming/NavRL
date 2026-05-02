@@ -147,7 +147,7 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        observation_dim = 9 # rpos(3), vel_w(3), ang_w(3), current_head_dir_2d(3)
+        observation_dim = 10 # rpos(3), vel_w(3), ang_w(3), current_head_dir_2d(3)
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -346,6 +346,16 @@ class NavigationEnv(IsaacEnv):
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
         # print("rpos_clipped_g", rpos_clipped_g)
 
+        # yaw reward for facing the goal direction
+        quat = self.root_state[..., 3:7]
+        current_yaw = quaternion_to_euler(quat)[..., 2]
+        diff = self.target_pos - self.root_state[..., :3]
+        target_yaw = torch.atan2(diff[..., 1], diff[..., 0])
+
+        diff_yaw = target_yaw - current_yaw
+        diff_yaw = (diff_yaw + np.pi) % (2 * np.pi) - np.pi
+
+
         # c. velocity in the goal frame
         vel_w = self.root_state[..., 7:10] # world vel
         # vel_w[...,2] = 0. # only care about horizontal velocity for the input, we will add vertical velocity as a separate input
@@ -356,12 +366,12 @@ class NavigationEnv(IsaacEnv):
         
         quat = self.root_state[..., 3:7]
 
-        rpos_head = vec_to_new_frame(rpos, head_dir_2d) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
+        rpos_head = vec_to_new_frame(rpos_clipped, head_dir_2d) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
         vel_head = vec_to_new_frame(vel_w, head_dir_2d)
 
         # final drone's internal states
         # drone_state = torch.cat([rpos_clipped, distance_2d, distance_z, vel_w , current_head_dir_2d], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_head, vel_head ,ang_head], dim=-1).squeeze(1)
+        drone_state = torch.cat([torch.cos(diff_yaw).unsqueeze(-1), torch.sin(diff_yaw).unsqueeze(-1) ,distance_2d, distance_z,vel_head ,ang_head], dim=-1).squeeze(1)
 
         # -----------------Network Input Final--------------
         obs = {
@@ -382,22 +392,13 @@ class NavigationEnv(IsaacEnv):
         reward_pos = (self.last_distance - distance).squeeze(-1)
 
 
-        # yaw reward for facing the goal direction
-        quat = self.root_state[..., 3:7]
-        current_yaw = quaternion_to_euler(quat)[..., 2]
-        diff = self.target_pos - self.root_state[..., :3]
-        target_yaw = torch.atan2(diff[..., 1], diff[..., 0])
-
-        diff_yaw = target_yaw - current_yaw
-        diff_yaw = (diff_yaw + np.pi) % (2 * np.pi) - np.pi
-
         b_t = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         b_t[torch.cos(diff_yaw[..., ]) > 0] = torch.cos(diff_yaw[..., ])[torch.cos(diff_yaw[..., ]) > 0]
         
         d_g = distance.squeeze(-1) / 48.0
         w_t= torch.ones(self.num_envs, 1, device=self.cfg.device)
         w_t[d_g < 1.0] = d_g[d_g < 1.0]
-
+        w_t = w_t.clamp(0.05, 1.0)
 
         d_tt = (self.last_distance - distance).squeeze(-1)
 

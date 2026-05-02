@@ -112,14 +112,13 @@ class Navigation:
         self.takeoff()
   
     def init_model(self):
-        observation_dim = 9
+        observation_dim = 10
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.cfg.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device),
-                    "current_head_dir_2d": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
                 }),
             }).expand(1)
         }, shape=[1], device=self.cfg.device)
@@ -419,8 +418,20 @@ class Navigation:
         rpos_head = vec_to_new_frame(rpos, head_dir_2d).squeeze(0).squeeze(0) # express the relative position in the heading coordinate, the x axis is the current heading direction, the y axis is on the horizontal plane and perpendicular to the heading direction, and the z axis is vertical
         vel_head = vec_to_new_frame(vel_w, head_dir_2d).squeeze(0).squeeze(0)
 
+        ang_head = vec_to_new_frame(ang_w, head_dir_2d).squeeze(0).squeeze(0) # coordinate change for angular velocity in the heading frame, where the x axis is the current heading direction
+
+        current_yaw = quaternion_to_euler(orientation)[..., 2]
+        target_yaw = torch.atan2(rpos[..., 1], rpos[..., 0])
+
+        diff_yaw = target_yaw - current_yaw
+        diff_yaw = (diff_yaw + np.pi) % (2 * np.pi) - np.pi
+
+
+        print("vel_head shape: ", vel_head.shape)
+        print("diff_yaw shape: ", diff_yaw.shape)
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_head, vel_head, ang_w], dim=-1).unsqueeze(0)
+        drone_state = torch.cat([torch.cos(diff_yaw), torch.sin(diff_yaw) ,distance_2d, distance_z,vel_head ,ang_head], dim=-1).unsqueeze(0)
+
 
         # Lidar States
         # if(self.raypoints is None or len(self.raypoints) == 0):
